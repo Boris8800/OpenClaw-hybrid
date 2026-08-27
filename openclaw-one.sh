@@ -1315,18 +1315,8 @@ def _chk_ollama():
     except Exception as e: return False,_local_url()+" ("+str(e)+")"
 def _fix_ollama():
     import shutil
-    allow=os.getenv("ALLOW_INSTALL","0")=="1"
     if not shutil.which("ollama"):
-        if allow and sys.platform=="darwin":
-            if not shutil.which("brew"):
-                return False,"Homebrew is required. Install it first: https://brew.sh"
-            print("Installing ollama via Homebrew ...")
-            try:
-                r=subprocess.run(["brew","install","ollama"],capture_output=True,text=True,timeout=900)
-                if r.returncode!=0: return False,"brew install ollama failed: "+r.stderr[-300:]
-            except Exception as e: return False,str(e)
-        else:
-            return False,"ollama is not installed; run: brew install ollama"
+        return False,"ollama is not installed; run: brew install ollama"
     return False,_local_url()+" not reachable. Start your own local AI server (e.g. `ollama serve`, or set LOCAL_URL/OLLAMA_BASE_URL to your existing OpenAI-compatible endpoint) then re-run."
 def _chk_model():
     try:
