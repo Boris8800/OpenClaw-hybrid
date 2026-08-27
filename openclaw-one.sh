@@ -1327,12 +1327,7 @@ def _fix_ollama():
             except Exception as e: return False,str(e)
         else:
             return False,"ollama is not installed; run: brew install ollama"
-    try:
-        subprocess.Popen(["ollama","serve"],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-        time.sleep(3)
-        ok,_=_chk_ollama()
-        return ok,("started ollama serve" if ok else "started, still unreachable; run: ollama serve")
-    except Exception as e: return False,str(e)
+    return False,_local_url()+" not reachable. Start your own local AI server (e.g. `ollama serve`, or set LOCAL_URL/OLLAMA_BASE_URL to your existing OpenAI-compatible endpoint) then re-run."
 def _chk_model():
     try:
         req=urllib.request.Request(_local_url()+"/models")
@@ -1341,14 +1336,6 @@ def _chk_model():
         return (LOCAL_MODEL_NAME in ids or any(LOCAL_MODEL_NAME in i for i in ids)), LOCAL_MODEL_NAME
     except Exception: return False, LOCAL_MODEL_NAME
 def _fix_model():
-    if os.getenv("ALLOW_INSTALL","0")=="1":
-        print(f"Pulling model {LOCAL_MODEL_NAME} (this may download several GB)...")
-        try:
-            r=subprocess.run(["ollama","pull",LOCAL_MODEL_NAME],timeout=1800)
-            if r.returncode==0:
-                ok,_=_chk_model()
-                if ok: return True,f"pulled {LOCAL_MODEL_NAME}"
-        except Exception as e: return False,str(e)
     return False, f"run: ollama pull {LOCAL_MODEL_NAME}"
 def _chk_api():
     have=[k for k in ("OPENAI_API_KEY","ANTHROPIC_API_KEY","DEEPSEEK_API_KEY") if os.getenv(k)]
@@ -1427,6 +1414,59 @@ def doctor_report(path, res=None):
     lines.append(f"Summary: `{json.dumps(res['summary'])}`")
     dest.parent.mkdir(parents=True,exist_ok=True); dest.write_text("\n".join(lines)+"\n",encoding="utf-8")
     log_event("doctor_report_generated",path=str(dest),all_ok=res["all_ok"]); return {"path":str(dest),"all_ok":res["all_ok"]}
+
+def detect_existing_install():
+    import shutil
+    found=[]
+    if (ROOT/"mempalace.sqlite3").exists():
+        found.append(("openclaw_home_data",str(ROOT)))
+    legacy=Path.home()/".openclaw"
+    if legacy.exists():
+        found.append(("legacy_dot_openclaw",str(legacy)))
+    pip=shutil.which("pip3") or shutil.which("pip")
+    if pip:
+        try:
+            r=subprocess.run([pip,"show","openclaw"],capture_output=True,text=True,timeout=30)
+            if r.returncode==0:
+                loc=[l for l in r.stdout.splitlines() if l.startswith("Location:")]
+                found.append(("pip_package",loc[0].split(": ",1)[1] if loc else "pip package"))
+        except Exception:
+            pass
+    return found
+
+def preinstall_cleanup():
+    found=detect_existing_install()
+    if not found:
+        return True
+    print("Existing OpenClaw installation detected:")
+    for name,path in found:
+        print(f"  - {name}: {path}")
+    if not sys.stdin.isatty():
+        print("No terminal available; keeping existing installation.")
+        return True
+    try:
+        ans=input("Delete it before proceeding? [y/N] ").strip().lower()
+    except (EOFError,KeyboardInterrupt):
+        return True
+    if ans not in ("y","yes"):
+        print("Keeping existing installation.")
+        return True
+    import shutil
+    trash=Path.home()/".Trash" if sys.platform=="darwin" else ROOT.parent/".openclaw-trash"
+    trash.mkdir(parents=True,exist_ok=True)
+    stamp=time.strftime("%Y%m%d-%H%M%S")
+    for i,(name,path) in enumerate(found):
+        target=Path(path)
+        dest=trash/(target.name+"-"+stamp+("-"+str(i) if i else ""))
+        try:
+            if target.is_dir() and not target.is_symlink():
+                shutil.move(str(target),str(dest))
+            else:
+                shutil.move(str(target),str(dest))
+            print("Moved to trash:",path,"->",dest)
+        except OSError as e:
+            print("Could not move to trash",path,":",e)
+    return True
 
 def health_report():
     return {"time":time.strftime("%Y-%m-%d %H:%M:%S"),"version":VERSION,"python":sys.version.split()[0],"platform":sys.platform,
@@ -1538,6 +1578,7 @@ def main():
         elif x.report: print(json.dumps(doctor_report(x.report,res),indent=2))
         else: print_doctor(res)
     elif x.cmd in ("install","setup"):
+        if not preinstall_cleanup(): sys.exit(1)
         os.environ["ALLOW_INSTALL"]="1"
         res=doctor(True)
         print_doctor(res)
