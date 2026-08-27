@@ -28,7 +28,25 @@ DB.commit()
 # LOCAL_URL at it; the protocol is always /chat/completions, so no server-
 # specific code is needed.
 LOCAL_MODEL_NAME = os.getenv("LOCAL_MODEL", "qwen2.5-coder:14b")
-MODELS = [{"name":LOCAL_MODEL_NAME,"url":os.getenv("LOCAL_URL",os.getenv("OLLAMA_BASE_URL","http://localhost:11434/v1")),"key":os.getenv("LOCAL_KEY",""),"weight":1,"provider":"local","kind":"local","role":"local_worker","context_window":int(os.getenv("LOCAL_CONTEXT_WINDOW","32768")),"tool_calls":True,"vision":True,"json_mode":True}]
+LOCAL_URL_CONF = os.getenv("LOCAL_URL", os.getenv("OLLAMA_BASE_URL","")).strip()
+# A local (Ollama/LM Studio/vLLM/...) endpoint is OPTIONAL. It is only added
+# as the implementation "worker" when one is configured (LOCAL_URL /
+# OLLAMA_BASE_URL). Otherwise the worker role falls back to an online model.
+MODELS = []
+if LOCAL_URL_CONF:
+    MODELS.append({"name":LOCAL_MODEL_NAME,"url":LOCAL_URL_CONF.rstrip("/"),"key":os.getenv("LOCAL_KEY",""),"weight":1,"provider":"local","kind":"local","role":"local_worker","context_window":int(os.getenv("LOCAL_CONTEXT_WINDOW","32768")),"tool_calls":True,"vision":True,"json_mode":True})
+def _promote_worker():
+    if any(m.get("role")=="local_worker" for m in MODELS): return
+    online=[m for m in MODELS if m.get("url")]
+    if online:
+        online.sort(key=lambda m:-float(m.get("weight",1)))
+        online[0]["role"]="local_worker"
+def worker_model():
+    for m in MODELS:
+        if m.get("role")=="local_worker": return m
+    return MODELS[0] if MODELS else None
+def worker_model_name():
+    m=worker_model(); return m["name"] if m else ""
 def add_online(name, url, key, provider, kind="openai_compatible", weight=4, context_window=32768, no_auth=False):
     # Add any OpenAI-/Anthropic-compatible endpoint. no_auth permits keyless
     # servers (local vLLM/LM Studio/llama.cpp on LAN, internal gateways, etc.).
@@ -49,6 +67,7 @@ try:
         add_online(provider.get("model",""),provider.get("base_url",""),key,provider.get("provider",provider.get("name","online")),kind,float(provider.get("weight",4)),int(provider.get("context_window",32768)),no_auth)
 except (ValueError,TypeError):
     pass
+_promote_worker()
 SUPERVISOR_MODEL_NAME = os.getenv("SUPERVISOR_MODEL", os.getenv("DEEPSEEK_MODEL", ""))
 PLAN_MODEL_NAME = os.getenv("API_PLAN_MODEL", os.getenv("DEEPSEEK_MODEL", SUPERVISOR_MODEL_NAME))
 REVIEW_MODEL_NAME = os.getenv("API_REVIEW_MODEL", os.getenv("DEEPSEEK_MODEL", SUPERVISOR_MODEL_NAME))
@@ -129,8 +148,8 @@ def extract_document(path):
 
 def ingest_image(path, instruction="Describe this image and extract all readable text."):
     p=Path(path).expanduser().resolve(); mime=mimetypes.guess_type(str(p))[0] or "image/jpeg"
-    model=next((m for m in MODELS if m["name"]==LOCAL_MODEL_NAME),None)
-    if not model: raise RuntimeError("local model is not configured")
+    model=worker_model()
+    if not model: raise RuntimeError("no worker model is configured")
     encoded=base64.b64encode(p.read_bytes()).decode()
     payload={"model":model["name"],"messages":[{"role":"user","content":[{"type":"text","text":instruction},{"type":"image_url","image_url":{"url":f"data:{mime};base64,{encoded}"}}]}],"temperature":0.1,"max_tokens":int(os.getenv("LOCAL_VISION_TOKENS","1200"))}
     log_event("local_image_analysis_started",file=str(p),model=model["name"]); result=request(model,payload)
@@ -848,7 +867,7 @@ def local_worker_loop(instruction, conversation="local-worker", max_rounds=6):
     transcript=instruction; final=""
     for round_no in range(max_rounds):
         log_event("local_worker_round",round=round_no+1)
-        r=chat(transcript,conversation=conversation,requested=LOCAL_MODEL_NAME,max_tokens=int(os.getenv("LOCAL_MAX_TOKENS","2048")))
+        r=chat(transcript,conversation=conversation,requested=worker_model_name(),max_tokens=int(os.getenv("LOCAL_MAX_TOKENS","2048")))
         final=r.get("choices",[{}])[0].get("message",{}).get("content","")
         calls=parse_tool_calls(final)
         if not calls: return final
@@ -913,7 +932,7 @@ def resume_task(task_id=None):
     result["task"]["resumed_from"]=saved.get("id"); save_task(result["task"]); return {"status":"resumed","task":result["task"],"answer":result.get("answer","")}
 
 def general_agent(goal, conversation="agent", model=None, max_steps=4):
-    if model and model != LOCAL_MODEL_NAME: raise RuntimeError("agent implementation model is fixed to the configured local worker")
+    if model and model != worker_model_name(): raise RuntimeError("agent implementation model is fixed to the configured worker")
     goal=validate_goal(goal); daily_learn(); task=create_task(goal); task["max_repair_cycles"]=MAX_REPAIR_CYCLES; task["repair_cycles"]=0; save_task(task)
     set_phase(task,"MEMORY_RECALL"); memory=mem_search(goal,int(os.getenv("MEMPALACE_RESULTS","5")))
     review_model=get_model(REVIEW_MODEL_NAME) if "get_model" in globals() else next((m for m in MODELS if m["name"]==REVIEW_MODEL_NAME),None)
@@ -1150,8 +1169,8 @@ def complexity_score(p):
 
 def candidates(prompt):
     """Return local worker first, then all configured healthy online providers."""
-    local=[m for m in MODELS if m["name"]==LOCAL_MODEL_NAME]
-    online=[m for m in MODELS if m["name"]!=LOCAL_MODEL_NAME and m.get("url")]
+    local=[m for m in MODELS if m.get("role")=="local_worker"]
+    online=[m for m in MODELS if m.get("role")!="local_worker" and m.get("url")]
     preferred=os.getenv("SUPERVISOR_MODEL","")
     online.sort(key=lambda m:(0 if m["name"]==preferred else 1,-float(m.get("weight",1))))
     ordered=local+online
@@ -1211,7 +1230,7 @@ def chat(prompt, conversation="default", system=None, stream=False, json_mode=Fa
     context=(system or os.getenv("OPENCLAW_SYSTEM","You are a reliable assistant."))
     if memories: context += "\nRelevant MemPalace memories:\n"+"\n".join("- ["+m["category"]+"] "+m["text"] for m in memories)
     messages=[{"role":"system","content":context},{"role":"user","content":prompt}]
-    is_supervisor=bool(requested and requested!=LOCAL_MODEL_NAME and any(m["name"]==requested and m.get("kind") in {"openai_compatible","anthropic"} for m in MODELS))
+    is_supervisor=bool(requested and requested!=worker_model_name() and any(m["name"]==requested and m.get("kind") in {"openai_compatible","anthropic"} for m in MODELS))
     token_limit=max_tokens or (int(os.getenv("SUPERVISOR_MAX_TOKENS","512")) if is_supervisor else int(os.getenv("OPENCLAW_MAX_TOKENS","2048")))
     if is_supervisor:
         safety=context_safety((system or "")+prompt,token_limit,int(os.getenv("API_CONTEXT_WINDOW","32768"))); log_event("context_safety",**safety)
@@ -1226,7 +1245,7 @@ def chat(prompt, conversation="default", system=None, stream=False, json_mode=Fa
         models=candidates(prompt)
     last=""
     for m in models:
-        call_supervisor=(m["name"]!=LOCAL_MODEL_NAME)
+        call_supervisor=(m.get("role")!="local_worker")
         call_token_limit=int(os.getenv("SUPERVISOR_MAX_TOKENS","512")) if call_supervisor else token_limit
         call_opts={**opts,"max_tokens":call_token_limit}
         if call_supervisor and not supervisor_budget_ok(max(1,len(prompt)//4)+call_token_limit):
@@ -1268,6 +1287,10 @@ def discover():
 
 def _chk_python():
     v=sys.version_info; return (v.major,v.minor)>= (3,8), sys.version.split()[0]
+def _chk_worker():
+    m=worker_model()
+    if m: return True, m["name"]+" ("+m.get("provider","?")+")"
+    return False,"no worker model configured. Set a local endpoint (LOCAL_URL/OLLAMA_BASE_URL) or an online API key (OPENAI_API_KEY/ANTHROPIC_API_KEY/DEEPSEEK_API_KEY)."
 def _chk_home():
     try: return ROOT.exists() and ROOT.is_dir() and os.access(ROOT,os.W_OK), str(ROOT)
     except Exception: return False, str(ROOT)
@@ -1308,17 +1331,20 @@ def _fix_files():
 def _local_url():
     return os.getenv("LOCAL_URL",os.getenv("OLLAMA_BASE_URL","http://localhost:11434/v1")).rstrip("/")
 def _chk_ollama():
+    if not LOCAL_URL_CONF: return True,"no local model configured (using online worker)"
     try:
         req=urllib.request.Request(_local_url()+"/models")
         with urllib.request.urlopen(req,timeout=4) as r: json.loads(r.read())
         return True,_local_url()
     except Exception as e: return False,_local_url()+" ("+str(e)+")"
 def _fix_ollama():
+    if not LOCAL_URL_CONF: return True,"no local model needed"
     import shutil
     if not shutil.which("ollama"):
         return False,"ollama is not installed; run: brew install ollama"
     return False,_local_url()+" not reachable. Start your own local AI server (e.g. `ollama serve`, or set LOCAL_URL/OLLAMA_BASE_URL to your existing OpenAI-compatible endpoint) then re-run."
 def _chk_model():
+    if not LOCAL_URL_CONF: return True,"no local model configured (using online worker)"
     try:
         req=urllib.request.Request(_local_url()+"/models")
         with urllib.request.urlopen(req,timeout=4) as r: data=json.loads(r.read())
@@ -1326,6 +1352,7 @@ def _chk_model():
         return (LOCAL_MODEL_NAME in ids or any(LOCAL_MODEL_NAME in i for i in ids)), LOCAL_MODEL_NAME
     except Exception: return False, LOCAL_MODEL_NAME
 def _fix_model():
+    if not LOCAL_URL_CONF: return True,"no local model needed"
     return False, f"run: ollama pull {LOCAL_MODEL_NAME}"
 def _chk_api():
     have=[k for k in ("OPENAI_API_KEY","ANTHROPIC_API_KEY","DEEPSEEK_API_KEY") if os.getenv(k)]
@@ -1358,8 +1385,9 @@ def doctor(auto=False):
       {"id":"home","name":"OpenClaw home directory exists & writable","check":_chk_home,"fix":_fix_home,"required":True},
       {"id":"db","name":"MemPalace database initialised & intact","check":_chk_db,"fix":_fix_db,"required":True},
       {"id":"files","name":"Activity/state files writable","check":_chk_files,"fix":_fix_files,"required":True},
-      {"id":"ollama","name":"Local model server reachable","check":_chk_ollama,"fix":_fix_ollama,"required":True},
-      {"id":"model","name":"Local model installed","check":_chk_model,"fix":_fix_model,"required":True},
+      {"id":"worker","name":"Worker model configured (local or online)","check":_chk_worker,"fix":None,"required":True},
+      {"id":"ollama","name":"Local model server reachable","check":_chk_ollama,"fix":_fix_ollama,"required":False},
+      {"id":"model","name":"Local model installed","check":_chk_model,"fix":_fix_model,"required":False},
       {"id":"api","name":"Online supervisor API keys","check":_chk_api,"fix":None,"required":False},
       {"id":"pdf","name":"PDF extraction tool (pdftotext)","check":_chk_pdf,"fix":_fix_pdf,"required":False},
       {"id":"img","name":"Image tools available (sips)","check":_chk_img,"fix":None,"required":True},
@@ -1465,7 +1493,7 @@ def health_report():
             "supervisor_budget":HEALTH.get("_supervisor_budget")}
 
 def show_config():
-    cfg={"openclaw_home":str(ROOT),"data_files":{"activity":str(ACTIVITY_FILE),"state":str(STATE_FILE),"learning":str(LEARNING_FILE),"health":str(HEALTH_FILE)},"local_model":LOCAL_MODEL_NAME,"supervisor_model":SUPERVISOR_MODEL_NAME,"supervisor_enabled":os.getenv("SUPERVISOR_ENABLED","1"),"terminal_policy":os.getenv("LOCAL_TERMINAL_POLICY","worker"),"models":[{"name":m["name"],"provider":m.get("provider"),"role":m.get("role")} for m in MODELS],"memory":mem_stats()}
+    cfg={"openclaw_home":str(ROOT),"data_files":{"activity":str(ACTIVITY_FILE),"state":str(STATE_FILE),"learning":str(LEARNING_FILE),"health":str(HEALTH_FILE)},"worker_model":worker_model_name(),"supervisor_model":SUPERVISOR_MODEL_NAME,"supervisor_enabled":os.getenv("SUPERVISOR_ENABLED","1"),"terminal_policy":os.getenv("LOCAL_TERMINAL_POLICY","worker"),"models":[{"name":m["name"],"provider":m.get("provider"),"role":m.get("role")} for m in MODELS],"memory":mem_stats()}
     print(json.dumps(cfg,indent=2))
 
 def repl():
@@ -1527,7 +1555,7 @@ def main():
     i=s.add_parser("info", help="search and gather page information"); i.add_argument("query"); i.add_argument("--limit",type=int,default=5)
     ing=s.add_parser("ingest", help="ingest a document or image into MemPalace locally"); ing.add_argument("path"); ing.add_argument("--category",default="document")
     x=p.parse_args()
-    if x.cmd=="providers": print(json.dumps([{"name":m["name"],"provider":m.get("provider","openai-compatible"),"online":m["name"]!=LOCAL_MODEL_NAME,"url":m["url"]} for m in MODELS],indent=2)); return
+    if x.cmd=="providers": print(json.dumps([{"name":m["name"],"provider":m.get("provider","openai-compatible"),"online":m.get("role")!="local_worker","role":m.get("role"),"url":m["url"]} for m in MODELS],indent=2)); return
     if x.cmd=="capabilities": print(json.dumps(dispatch_tool("model_capabilities"),indent=2)); return
     if x.cmd=="ingest": print(json.dumps(dispatch_tool("ingest_file",{"path":x.path,"category":x.category}),indent=2,ensure_ascii=False)); return
     if x.cmd=="tools": print(json.dumps(TOOL_REGISTRY,indent=2)); return
