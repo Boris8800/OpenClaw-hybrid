@@ -1,0 +1,21 @@
+#!/bin/bash
+# OpenClaw Installer - double-click to run the install checklist in a Terminal window.
+# Locates openclaw-one.sh in the same folder as this .app bundle.
+
+app_root="$(cd "$(dirname "$0")/../.." && pwd)"   # .../OpenClaw Installer.app
+base="$(dirname "$app_root")"                      # the folder holding the .app
+
+openclaw="$base/openclaw-one.sh"
+
+if [ ! -f "$openclaw" ]; then
+    osascript -e "display alert \"openclaw-one.sh not found\" message \"Expected it next to this app in:\n$base\"" \
+              -e 'return'
+    exit 1
+fi
+
+osascript -e "tell application \"Terminal\"" \
+          -e "do script \"cd '$base' && chmod +x './openclaw-one.sh' && echo '=== OpenClaw Installer ===' && './openclaw-one.sh' install\"" \
+          -e "activate" \
+          -e "end tell"
+
+exit 0
