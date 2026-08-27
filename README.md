@@ -4,7 +4,7 @@
 
 **A single-file, cross-platform AI agent gateway with persistent memory**
 
-macOS · Linux · Windows &nbsp;|&nbsp; Local (Ollama) + optional online supervisors (OpenAI / Anthropic / DeepSeek)
+macOS · Linux · Windows &nbsp;|&nbsp; Any local model server + any online API (OpenAI-compatible or Anthropic)
 
 ![Python](https://img.shields.io/badge/Python-3.8%2B-3776AB?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/macOS%20%26%20Windows-ready-2ea44f)
@@ -18,8 +18,8 @@ macOS · Linux · Windows &nbsp;|&nbsp; Local (Ollama) + optional online supervi
 
 One file (`openclaw-one.sh`) is a hybrid agent gateway that:
 
-- **Runs entirely locally** with an Ollama model (default `qwen2.5-coder:14b`) for implementation and tools.
-- **Optionally uses online models** as advisory supervisors/planners (OpenAI, Anthropic, or DeepSeek) — they plan and review, but never write files or run commands.
+- **Runs entirely locally** with any OpenAI-compatible model server (Ollama, LM Studio, vLLM, llama.cpp, GPT4All, etc.; default `qwen2.5-coder:14b`) for implementation and tools.
+- **Optionally uses online models** as advisory supervisors/planners (OpenAI, Anthropic, DeepSeek, or any other OpenAI-compatible/Anthropic endpoint) — they plan and review, but never write files or run commands.
 - **Remembers** — everything meaningful is stored in a local **MemPalace** (SQLite), searchable by relevance.
 - **Gives the agent safe local tools** — file ops, terminal (policy-gated), web search, memory, diagnostics — behind a strict role/safety model.
 
@@ -49,6 +49,8 @@ openclaw-one.bat chat "Hello"
 
 `install` (aliases: `doctor`, `setup`) runs a 10-step checklist and **auto-fixes safe issues** (creates the home folder, rebuilds a corrupt database, starts `ollama serve`, ensures data files and working roots exist).
 
+> The local model server is **any OpenAI-compatible endpoint** — point `LOCAL_URL` at whatever server you use. Ollama is only the default/example; the auto-fix and troubleshooting steps below assume Ollama, but LM Studio, vLLM, llama.cpp, and GPT4All work identically.
+
 ```bash
 ./openclaw-one.sh doctor            # report only
 ./openclaw-one.sh doctor --auto     # also apply safe fixes
@@ -62,9 +64,9 @@ ALLOW_INSTALL=1 ./openclaw-one.sh install   # also install Homebrew packages (po
 | Requirement | Purpose | How to install |
 | --- | --- | --- |
 | Python 3.8+ | Runtime | [python.org](https://www.python.org) |
-| Ollama | Local model server | `brew install ollama` then `ollama serve` |
-| Local model | Default worker model | `ollama pull qwen2.5-coder:14b` |
-| Online API keys *(optional)* | Supervisors | Set `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and/or `DEEPSEEK_API_KEY` |
+| A local model server | Local worker backend | Any OpenAI-compatible server — e.g. Ollama (`brew install ollama` then `ollama serve`), LM Studio, vLLM, llama.cpp |
+| Local model | Default worker model | Pull it on your chosen server (Ollama: `ollama pull qwen2.5-coder:14b`) |
+| Online API keys *(optional)* | Supervisors | Set `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and/or `DEEPSEEK_API_KEY`, or configure any endpoint via `OPENCLAW_ONLINE_PROVIDERS` |
 | `pdftotext` *(optional)* | PDF ingest | `brew install poppler` |
 
 ---
@@ -77,8 +79,10 @@ All configuration is via environment variables (safe defaults shown).
 | --- | --- | --- |
 | `OPENCLAW_HOME` | `~/openclaw` | Where data lives (`mempalace.sqlite3`, logs, state) |
 | `LOCAL_MODEL` | `qwen2.5-coder:14b` | Local worker model |
-| `LOCAL_URL` / `OLLAMA_BASE_URL` | `http://localhost:11434/v1` | Ollama endpoint |
-| `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `DEEPSEEK_API_KEY` | — | Online supervisors |
+| `LOCAL_URL` / `OLLAMA_BASE_URL` | `http://localhost:11434/v1` | Local OpenAI-compatible endpoint (Ollama, LM Studio, vLLM, llama.cpp, …) |
+| `LOCAL_KEY` | — | Optional key for a local server that requires one |
+| `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `DEEPSEEK_API_KEY` | — | Built-in online supervisors |
+| `OPENCLAW_ONLINE_PROVIDERS` | `[]` | JSON list of extra OpenAI-/Anthropic-compatible models (see below) |
 | `SUPERVISOR_ENABLED` | `1` | Turn online review on/off |
 | `LOCAL_TERMINAL_POLICY` | `worker` | `safe` · `worker` · `unrestricted` |
 | `LOCAL_WRITE_ENABLED` | `1` | Allow the agent to write files |
@@ -87,6 +91,34 @@ All configuration is via environment variables (safe defaults shown).
 | `ALLOW_INSTALL` | `0` | Permit `install` to run Homebrew installs |
 
 View live config with `./openclaw-one.sh config` or `./openclaw-one.sh system`.
+
+### Adding any online provider
+
+Every model speaks the standard **OpenAI `/chat/completions`** (or **Anthropic `/messages`**) protocol, so any vendor can be wired in without code changes — keyed or keyless. Set `OPENCLAW_ONLINE_PROVIDERS` to a JSON array:
+
+```bash
+# Keyed provider (e.g. a gateway, OpenRouter, Groq, Together, a self-hosted server)
+export OPENCLAW_ONLINE_PROVIDERS='[{
+  "model": "provider-model-id",
+  "base_url": "https://gateway.example.com/v1",
+  "api_key_env": "MY_API_KEY",
+  "provider": "myvendor",
+  "kind": "openai_compatible",
+  "weight": 4,
+  "context_window": 32768
+}]'
+
+# Keyless local/LAN server (LM Studio, vLLM, llama.cpp on your network)
+export OPENCLAW_ONLINE_PROVIDERS='[{
+  "model": "local-hosted-model",
+  "base_url": "http://192.168.1.50:8000/v1",
+  "no_auth": true,
+  "kind": "openai_compatible"
+}]'
+```
+
+- `kind` is `openai_compatible` (default) or `anthropic`.
+- Omit `api_key_env`/`api_key` and set `no_auth: true` for servers that need no authentication.
 
 ---
 
@@ -182,8 +214,10 @@ Data written to `OPENCLAW_HOME` (default `~/openclaw`):
 
 | Symptom | Fix |
 | --- | --- |
-| `ollama` connection refused | `ollama serve`, then `./openclaw-one.sh doctor --auto` |
-| Model not found | `ollama pull qwen2.5-coder:14b` |
+| Local server connection refused | Start your model server (Ollama: `ollama serve`), then `./openclaw-one.sh doctor --auto` |
+| Model not found | Pull it on your server (Ollama: `ollama pull qwen2.5-coder:14b`); for other servers make sure `LOCAL_MODEL` matches a served model id |
+| Use a non-Ollama server | Point `LOCAL_URL` at it (e.g. `http://localhost:8000/v1`) and set `LOCAL_MODEL` to a served model |
+| Keyless online server not used | Add it to `OPENCLAW_ONLINE_PROVIDERS` with `no_auth: true` |
 | PDF ingest fails | `brew install poppler` |
 | Supervisor skipped / budget | Online daily call/token budget hit; check `system` |
 | Agent can't write files | Set `LOCAL_WRITE_ENABLED=1`, ensure path is in `OPENCLAW_ALLOWED_ROOTS` |

@@ -23,18 +23,30 @@ DB.execute("""CREATE TABLE IF NOT EXISTS memories(
 DB.execute("CREATE TABLE IF NOT EXISTS cache(key TEXT PRIMARY KEY,value TEXT,expires INTEGER)")
 DB.commit()
 
-# Configure models and roles. Local worker and online supervisors are separate by construction.
+# Configure models and roles. The LOCAL worker is any OpenAI-compatible endpoint
+# (Ollama, LM Studio, vLLM, llama.cpp, GPT4All, a local gateway, etc.). Point
+# LOCAL_URL at it; the protocol is always /chat/completions, so no server-
+# specific code is needed.
 LOCAL_MODEL_NAME = os.getenv("LOCAL_MODEL", "qwen2.5-coder:14b")
 MODELS = [{"name":LOCAL_MODEL_NAME,"url":os.getenv("LOCAL_URL",os.getenv("OLLAMA_BASE_URL","http://localhost:11434/v1")),"key":os.getenv("LOCAL_KEY",""),"weight":1,"provider":"local","kind":"local","role":"local_worker","context_window":int(os.getenv("LOCAL_CONTEXT_WINDOW","32768")),"tool_calls":True,"vision":True,"json_mode":True}]
-def add_online(name, url, key, provider, kind="openai_compatible", weight=4, context_window=32768):
-    if url and key: MODELS.append({"name":name,"url":url,"key":key,"weight":weight,"provider":provider,"kind":kind,"role":"supervisor","context_window":context_window,"tool_calls":False,"vision":provider in {"openai","anthropic"},"json_mode":True})
+def add_online(name, url, key, provider, kind="openai_compatible", weight=4, context_window=32768, no_auth=False):
+    # Add any OpenAI-/Anthropic-compatible endpoint. no_auth permits keyless
+    # servers (local vLLM/LM Studio/llama.cpp on LAN, internal gateways, etc.).
+    if url and (key or no_auth):
+        MODELS.append({"name":name,"url":url,"key":key,"weight":weight,"provider":provider,"kind":kind,"role":"supervisor","context_window":context_window,"tool_calls":False,"vision":provider in {"openai","anthropic"},"json_mode":True})
+# Known providers are added only when their key is set; every endpoint follows
+# the OpenAI /chat/completions or Anthropic /messages protocol, so any model can
+# be wired in via env vars -- no provider-specific code required.
 add_online(os.getenv("OPENAI_MODEL","gpt-4o-mini"),os.getenv("OPENAI_BASE_URL","https://api.openai.com/v1"),os.getenv("OPENAI_API_KEY",""),"openai")
 add_online(os.getenv("ANTHROPIC_MODEL","claude-3-5-haiku-latest"),os.getenv("ANTHROPIC_BASE_URL","https://api.anthropic.com/v1"),os.getenv("ANTHROPIC_API_KEY",""),"anthropic","anthropic")
 add_online(os.getenv("DEEPSEEK_MODEL","deepseek-chat"),os.getenv("DEEPSEEK_BASE_URL","https://api.deepseek.com/v1"),os.getenv("DEEPSEEK_API_KEY",""),"deepseek")
 try:
     for provider in json.loads(os.getenv("OPENCLAW_ONLINE_PROVIDERS","[]")):
         key=os.getenv(provider.get("api_key_env",""),provider.get("api_key",""))
-        add_online(provider.get("model",""),provider.get("base_url",""),key,provider.get("provider",provider.get("name","online")),"openai_compatible",float(provider.get("weight",4)),int(provider.get("context_window",32768)))
+        no_auth=str(provider.get("no_auth",provider.get("auth","key"))).lower() in {"true","1","yes","none","keyless"}
+        kind=provider.get("kind","openai_compatible")
+        if kind not in {"openai_compatible","anthropic"}: kind="openai_compatible"
+        add_online(provider.get("model",""),provider.get("base_url",""),key,provider.get("provider",provider.get("name","online")),kind,float(provider.get("weight",4)),int(provider.get("context_window",32768)),no_auth)
 except (ValueError,TypeError):
     pass
 SUPERVISOR_MODEL_NAME = os.getenv("SUPERVISOR_MODEL", os.getenv("DEEPSEEK_MODEL", ""))
@@ -1199,7 +1211,7 @@ def chat(prompt, conversation="default", system=None, stream=False, json_mode=Fa
     context=(system or os.getenv("OPENCLAW_SYSTEM","You are a reliable assistant."))
     if memories: context += "\nRelevant MemPalace memories:\n"+"\n".join("- ["+m["category"]+"] "+m["text"] for m in memories)
     messages=[{"role":"system","content":context},{"role":"user","content":prompt}]
-    is_supervisor=bool(requested and requested!=LOCAL_MODEL_NAME and any(m["name"]==requested and m.get("provider") in {"openai","anthropic","deepseek","online","openai-compatible"} for m in MODELS))
+    is_supervisor=bool(requested and requested!=LOCAL_MODEL_NAME and any(m["name"]==requested and m.get("kind") in {"openai_compatible","anthropic"} for m in MODELS))
     token_limit=max_tokens or (int(os.getenv("SUPERVISOR_MAX_TOKENS","512")) if is_supervisor else int(os.getenv("OPENCLAW_MAX_TOKENS","2048")))
     if is_supervisor:
         safety=context_safety((system or "")+prompt,token_limit,int(os.getenv("API_CONTEXT_WINDOW","32768"))); log_event("context_safety",**safety)
