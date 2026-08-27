@@ -1601,6 +1601,8 @@ def main():
         res=doctor(True)
         print_doctor(res)
         if not res["all_ok"]: sys.exit(1)
+        print("\nInstallation complete. Starting OpenClaw interactive session (type 'exit' to quit)...\n")
+        repl()
     elif x.cmd=="health": print(json.dumps(HEALTH,indent=2))
     elif x.cmd=="discover": discover()
     elif x.cmd=="search": print(json.dumps(research(x.query,x.limit,x.fetch),indent=2))
