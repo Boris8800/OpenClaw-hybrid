@@ -1600,8 +1600,9 @@ def main():
         os.environ["ALLOW_INSTALL"]="1"
         res=doctor(True)
         print_doctor(res)
-        if not res["all_ok"]: sys.exit(1)
-        print("\nInstallation complete. Starting OpenClaw interactive session (type 'exit' to quit)...\n")
+        if not res["all_ok"]:
+            print("\n[ warn ] Installation finished with issues (you can still start OpenClaw, but set a model later to use AI features).\n")
+        print("Starting OpenClaw interactive session (type 'exit' to quit)...\n")
         repl()
     elif x.cmd=="health": print(json.dumps(HEALTH,indent=2))
     elif x.cmd=="discover": discover()
