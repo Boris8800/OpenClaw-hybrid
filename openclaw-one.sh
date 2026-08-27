@@ -33,8 +33,11 @@ LOCAL_URL_CONF = os.getenv("LOCAL_URL", os.getenv("OLLAMA_BASE_URL","")).strip()
 # as the implementation "worker" when one is configured (LOCAL_URL /
 # OLLAMA_BASE_URL). Otherwise the worker role falls back to an online model.
 MODELS = []
-if LOCAL_URL_CONF:
-    MODELS.append({"name":LOCAL_MODEL_NAME,"url":LOCAL_URL_CONF.rstrip("/"),"key":os.getenv("LOCAL_KEY",""),"weight":1,"provider":"local","kind":"local","role":"local_worker","context_window":int(os.getenv("LOCAL_CONTEXT_WINDOW","32768")),"tool_calls":True,"vision":True,"json_mode":True})
+def add_online(name, url, key, provider, kind="openai_compatible", weight=4, context_window=32768, no_auth=False):
+    # Add any OpenAI-/Anthropic-compatible endpoint. no_auth permits keyless
+    # servers (local vLLM/LM Studio/llama.cpp on LAN, internal gateways, etc.).
+    if url and (key or no_auth):
+        MODELS.append({"name":name,"url":url,"key":key,"weight":weight,"provider":provider,"kind":kind,"role":"supervisor","context_window":context_window,"tool_calls":False,"vision":provider in {"openai","anthropic"},"json_mode":True})
 def _promote_worker():
     if any(m.get("role")=="local_worker" for m in MODELS): return
     online=[m for m in MODELS if m.get("url")]
@@ -47,27 +50,37 @@ def worker_model():
     return MODELS[0] if MODELS else None
 def worker_model_name():
     m=worker_model(); return m["name"] if m else ""
-def add_online(name, url, key, provider, kind="openai_compatible", weight=4, context_window=32768, no_auth=False):
-    # Add any OpenAI-/Anthropic-compatible endpoint. no_auth permits keyless
-    # servers (local vLLM/LM Studio/llama.cpp on LAN, internal gateways, etc.).
-    if url and (key or no_auth):
-        MODELS.append({"name":name,"url":url,"key":key,"weight":weight,"provider":provider,"kind":kind,"role":"supervisor","context_window":context_window,"tool_calls":False,"vision":provider in {"openai","anthropic"},"json_mode":True})
-# Known providers are added only when their key is set; every endpoint follows
-# the OpenAI /chat/completions or Anthropic /messages protocol, so any model can
-# be wired in via env vars -- no provider-specific code required.
-add_online(os.getenv("OPENAI_MODEL","gpt-4o-mini"),os.getenv("OPENAI_BASE_URL","https://api.openai.com/v1"),os.getenv("OPENAI_API_KEY",""),"openai")
-add_online(os.getenv("ANTHROPIC_MODEL","claude-3-5-haiku-latest"),os.getenv("ANTHROPIC_BASE_URL","https://api.anthropic.com/v1"),os.getenv("ANTHROPIC_API_KEY",""),"anthropic","anthropic")
-add_online(os.getenv("DEEPSEEK_MODEL","deepseek-chat"),os.getenv("DEEPSEEK_BASE_URL","https://api.deepseek.com/v1"),os.getenv("DEEPSEEK_API_KEY",""),"deepseek")
-try:
-    for provider in json.loads(os.getenv("OPENCLAW_ONLINE_PROVIDERS","[]")):
-        key=os.getenv(provider.get("api_key_env",""),provider.get("api_key",""))
-        no_auth=str(provider.get("no_auth",provider.get("auth","key"))).lower() in {"true","1","yes","none","keyless"}
-        kind=provider.get("kind","openai_compatible")
-        if kind not in {"openai_compatible","anthropic"}: kind="openai_compatible"
-        add_online(provider.get("model",""),provider.get("base_url",""),key,provider.get("provider",provider.get("name","online")),kind,float(provider.get("weight",4)),int(provider.get("context_window",32768)),no_auth)
-except (ValueError,TypeError):
-    pass
-_promote_worker()
+# Env file (KEY=VALUE lines) loaded into os.environ so keys entered in the
+# setup menu persist and take effect on later runs.
+ENV_FILE = ROOT / "openclaw.env"
+def _load_env_file():
+    if not ENV_FILE.exists(): return
+    for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+        line=line.strip()
+        if not line or line.startswith("#") or "=" not in line: continue
+        k,v=line.split("=",1); os.environ.setdefault(k.strip(),v.strip())
+_load_env_file()
+def build_models():
+    # Rebuild the MODELS list from env vars (used at startup and after setup).
+    global MODELS
+    local_url=os.getenv("LOCAL_URL",os.getenv("OLLAMA_BASE_URL","")).strip()
+    MODELS=[]
+    if local_url:
+        MODELS.append({"name":LOCAL_MODEL_NAME,"url":local_url.rstrip("/"),"key":os.getenv("LOCAL_KEY",""),"weight":1,"provider":"local","kind":"local","role":"local_worker","context_window":int(os.getenv("LOCAL_CONTEXT_WINDOW","32768")),"tool_calls":True,"vision":True,"json_mode":True})
+    add_online(os.getenv("OPENAI_MODEL","gpt-4o-mini"),os.getenv("OPENAI_BASE_URL","https://api.openai.com/v1"),os.getenv("OPENAI_API_KEY",""),"openai")
+    add_online(os.getenv("ANTHROPIC_MODEL","claude-3-5-haiku-latest"),os.getenv("ANTHROPIC_BASE_URL","https://api.anthropic.com/v1"),os.getenv("ANTHROPIC_API_KEY",""),"anthropic","anthropic")
+    add_online(os.getenv("DEEPSEEK_MODEL","deepseek-chat"),os.getenv("DEEPSEEK_BASE_URL","https://api.deepseek.com/v1"),os.getenv("DEEPSEEK_API_KEY",""),"deepseek")
+    try:
+        for provider in json.loads(os.getenv("OPENCLAW_ONLINE_PROVIDERS","[]")):
+            key=os.getenv(provider.get("api_key_env",""),provider.get("api_key",""))
+            no_auth=str(provider.get("no_auth",provider.get("auth","key"))).lower() in {"true","1","yes","none","keyless"}
+            kind=provider.get("kind","openai_compatible")
+            if kind not in {"openai_compatible","anthropic"}: kind="openai_compatible"
+            add_online(provider.get("model",""),provider.get("base_url",""),key,provider.get("provider",provider.get("name","online")),kind,float(provider.get("weight",4)),int(provider.get("context_window",32768)),no_auth)
+    except (ValueError,TypeError):
+        pass
+    _promote_worker()
+build_models()
 SUPERVISOR_MODEL_NAME = os.getenv("SUPERVISOR_MODEL", os.getenv("DEEPSEEK_MODEL", ""))
 PLAN_MODEL_NAME = os.getenv("API_PLAN_MODEL", os.getenv("DEEPSEEK_MODEL", SUPERVISOR_MODEL_NAME))
 REVIEW_MODEL_NAME = os.getenv("API_REVIEW_MODEL", os.getenv("DEEPSEEK_MODEL", SUPERVISOR_MODEL_NAME))
@@ -1328,23 +1341,25 @@ def _fix_files():
         with ACTIVITY_FILE.open("a"): pass
         return True,"ready"
     except Exception as e: return False,str(e)
+def _local_configured():
+    return bool(os.getenv("LOCAL_URL") or os.getenv("OLLAMA_BASE_URL"))
 def _local_url():
     return os.getenv("LOCAL_URL",os.getenv("OLLAMA_BASE_URL","http://localhost:11434/v1")).rstrip("/")
 def _chk_ollama():
-    if not LOCAL_URL_CONF: return True,"no local model configured (using online worker)"
+    if not _local_configured(): return True,"no local model configured (using online worker)"
     try:
         req=urllib.request.Request(_local_url()+"/models")
         with urllib.request.urlopen(req,timeout=4) as r: json.loads(r.read())
         return True,_local_url()
     except Exception as e: return False,_local_url()+" ("+str(e)+")"
 def _fix_ollama():
-    if not LOCAL_URL_CONF: return True,"no local model needed"
+    if not _local_configured(): return True,"no local model needed"
     import shutil
     if not shutil.which("ollama"):
         return False,"ollama is not installed; run: brew install ollama"
     return False,_local_url()+" not reachable. Start your own local AI server (e.g. `ollama serve`, or set LOCAL_URL/OLLAMA_BASE_URL to your existing OpenAI-compatible endpoint) then re-run."
 def _chk_model():
-    if not LOCAL_URL_CONF: return True,"no local model configured (using online worker)"
+    if not _local_configured(): return True,"no local model configured (using online worker)"
     try:
         req=urllib.request.Request(_local_url()+"/models")
         with urllib.request.urlopen(req,timeout=4) as r: data=json.loads(r.read())
@@ -1352,7 +1367,7 @@ def _chk_model():
         return (LOCAL_MODEL_NAME in ids or any(LOCAL_MODEL_NAME in i for i in ids)), LOCAL_MODEL_NAME
     except Exception: return False, LOCAL_MODEL_NAME
 def _fix_model():
-    if not LOCAL_URL_CONF: return True,"no local model needed"
+    if not _local_configured(): return True,"no local model needed"
     return False, f"run: ollama pull {LOCAL_MODEL_NAME}"
 def _chk_api():
     have=[k for k in ("OPENAI_API_KEY","ANTHROPIC_API_KEY","DEEPSEEK_API_KEY") if os.getenv(k)]
@@ -1496,16 +1511,78 @@ def show_config():
     cfg={"openclaw_home":str(ROOT),"data_files":{"activity":str(ACTIVITY_FILE),"state":str(STATE_FILE),"learning":str(LEARNING_FILE),"health":str(HEALTH_FILE)},"worker_model":worker_model_name(),"supervisor_model":SUPERVISOR_MODEL_NAME,"supervisor_enabled":os.getenv("SUPERVISOR_ENABLED","1"),"terminal_policy":os.getenv("LOCAL_TERMINAL_POLICY","worker"),"models":[{"name":m["name"],"provider":m.get("provider"),"role":m.get("role")} for m in MODELS],"memory":mem_stats()}
     print(json.dumps(cfg,indent=2))
 
+def save_env(key,value):
+    # Persist a key to the env file (does not print the secret).
+    lines=[]
+    if ENV_FILE.exists(): lines=ENV_FILE.read_text(encoding="utf-8").splitlines()
+    out=[]; found=False
+    for l in lines:
+        if l.strip().startswith(key+"="): out.append(key+"="+value.strip()); found=True
+        else: out.append(l)
+    if not found: out.append(key+"="+value.strip())
+    ENV_FILE.write_text("\n".join(out)+"\n",encoding="utf-8")
+    os.environ[key]=value.strip()
+    log_event("provider_key_saved",key=key)
+
+def setup_menu():
+    """Interactive first-run menu: enter API keys / configure a local endpoint."""
+    print("\n=== OpenClaw Setup ===")
+    print("Configure at least one AI model so OpenClaw can work.")
+    print(" 1) OpenAI API key")
+    print(" 2) Anthropic (Claude) API key")
+    print(" 3) DeepSeek API key")
+    print(" 4) Local model endpoint (LOCAL_URL, e.g. Ollama/LM Studio/vLLM)")
+    print(" 5) Show current providers")
+    print(" 6) Done / exit setup")
+    while True:
+        try: choice=input("setup> ").strip()
+        except (EOFError,KeyboardInterrupt): print(); break
+        if choice in {"1","openai"}:
+            k=input("OpenAI API key (sk-...): ").strip()
+            if k: save_env("OPENAI_API_KEY",k); print("Saved. Reloading models...\n"); build_models()
+        elif choice in {"2","anthropic"}:
+            k=input("Anthropic API key (sk-ant-...): ").strip()
+            if k: save_env("ANTHROPIC_API_KEY",k); print("Saved. Reloading models...\n"); build_models()
+        elif choice in {"3","deepseek"}:
+            k=input("DeepSeek API key (sk-...): ").strip()
+            if k: save_env("DEEPSEEK_API_KEY",k); print("Saved. Reloading models...\n"); build_models()
+        elif choice in {"4","local"}:
+            url=input("Local endpoint URL (e.g. http://localhost:11434/v1): ").strip()
+            if url: save_env("LOCAL_URL",url); print("Saved. Reloading models...\n"); build_models()
+        elif choice in {"5","show"}:
+            if not MODELS: print("  (no models configured)")
+            for m in MODELS: print(f"  - {m['name']}  provider={m.get('provider')}  role={m.get('role')}")
+        elif choice in {"6","done","exit","q"}:
+            print("Done. Type /exit to restart OpenClaw for changes to fully apply if needed.")
+            break
+        else:
+            print("Enter a number 1-6.")
+
 def repl():
-    print("OpenClaw REPL. Type /exit or Ctrl-D to quit.")
+    print("OpenClaw REPL. Type /help for commands, /exit or Ctrl-D to quit.")
+    if not MODELS:
+        print("[ setup ] No AI model configured yet. Running setup menu...")
+        setup_menu()
+        if not MODELS: print("[ warn ] Still no model configured; type /setup any time to add one.")
     history=[]
     while True:
         try: line=input("openclaw> ").strip()
         except (EOFError,KeyboardInterrupt): print(); return
         if not line: continue
         if line in {"/exit","/quit","quit"}: return
+        if line in {"/help","help"}:
+            print("Commands: /setup  /providers  /memory  /exit")
+            print("Or type any message to chat with the configured model.")
+            continue
+        if line in {"/setup","setup"}: setup_menu(); continue
+        if line in {"/providers","providers"}:
+            for m in MODELS: print(f"  - {m['name']}  provider={m.get('provider')}  role={m.get('role')}")
+            continue
         if line=="/memory":
             print(json.dumps(mem_stats(),indent=2)); continue
+        if not MODELS:
+            print("[ error ] No model configured. Run /setup to add an API key or local endpoint.")
+            continue
         history.append(line)
         r=chat(line,conversation="repl")
         print(r.get("choices",[{}])[0].get("message",{}).get("content",""))
