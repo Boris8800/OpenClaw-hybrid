@@ -1303,17 +1303,18 @@ def _chk_ollama():
     except Exception as e: return False,_local_url()+" ("+str(e)+")"
 def _fix_ollama():
     import shutil
+    allow=os.getenv("ALLOW_INSTALL","0")=="1"
     if not shutil.which("ollama"):
-        if os.getenv("ALLOW_INSTALL","0")=="1" and sys.platform=="darwin":
+        if allow and sys.platform=="darwin":
+            if not shutil.which("brew"):
+                return False,"Homebrew is required. Install it first: https://brew.sh"
+            print("Installing ollama via Homebrew ...")
             try:
-                r=subprocess.run(["brew","install","ollama"],capture_output=True,text=True,timeout=600)
-                if r.returncode==0:
-                    subprocess.Popen(["ollama","serve"],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-                    time.sleep(3)
-                    ok,_=_chk_ollama()
-                    return ok,("installed and started ollama" if ok else "installed ollama; run: ollama serve")
-            except Exception: pass
-        return False,"ollama is not installed; run: brew install ollama"
+                r=subprocess.run(["brew","install","ollama"],capture_output=True,text=True,timeout=900)
+                if r.returncode!=0: return False,"brew install ollama failed: "+r.stderr[-300:]
+            except Exception as e: return False,str(e)
+        else:
+            return False,"ollama is not installed; run: brew install ollama"
     try:
         subprocess.Popen(["ollama","serve"],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         time.sleep(3)
@@ -1328,6 +1329,14 @@ def _chk_model():
         return (LOCAL_MODEL_NAME in ids or any(LOCAL_MODEL_NAME in i for i in ids)), LOCAL_MODEL_NAME
     except Exception: return False, LOCAL_MODEL_NAME
 def _fix_model():
+    if os.getenv("ALLOW_INSTALL","0")=="1":
+        print(f"Pulling model {LOCAL_MODEL_NAME} (this may download several GB)...")
+        try:
+            r=subprocess.run(["ollama","pull",LOCAL_MODEL_NAME],timeout=1800)
+            if r.returncode==0:
+                ok,_=_chk_model()
+                if ok: return True,f"pulled {LOCAL_MODEL_NAME}"
+        except Exception as e: return False,str(e)
     return False, f"run: ollama pull {LOCAL_MODEL_NAME}"
 def _chk_api():
     have=[k for k in ("OPENAI_API_KEY","ANTHROPIC_API_KEY","DEEPSEEK_API_KEY") if os.getenv(k)]
@@ -1356,16 +1365,16 @@ def _fix_roots():
 
 def doctor(auto=False):
     steps=[
-      {"id":"python","name":"Python 3.8+ available","check":_chk_python,"fix":None},
-      {"id":"home","name":"OpenClaw home directory exists & writable","check":_chk_home,"fix":_fix_home},
-      {"id":"db","name":"MemPalace database initialised & intact","check":_chk_db,"fix":_fix_db},
-      {"id":"files","name":"Activity/state files writable","check":_chk_files,"fix":_fix_files},
-      {"id":"ollama","name":"Local model server reachable","check":_chk_ollama,"fix":_fix_ollama},
-      {"id":"model","name":"Local model installed","check":_chk_model,"fix":_fix_model},
-      {"id":"api","name":"Online supervisor API keys","check":_chk_api,"fix":None},
-      {"id":"pdf","name":"PDF extraction tool (pdftotext)","check":_chk_pdf,"fix":_fix_pdf},
-      {"id":"img","name":"Image tools available (sips)","check":_chk_img,"fix":None},
-      {"id":"roots","name":"Allowed working roots exist","check":_chk_roots,"fix":_fix_roots},
+      {"id":"python","name":"Python 3.8+ available","check":_chk_python,"fix":None,"required":True},
+      {"id":"home","name":"OpenClaw home directory exists & writable","check":_chk_home,"fix":_fix_home,"required":True},
+      {"id":"db","name":"MemPalace database initialised & intact","check":_chk_db,"fix":_fix_db,"required":True},
+      {"id":"files","name":"Activity/state files writable","check":_chk_files,"fix":_fix_files,"required":True},
+      {"id":"ollama","name":"Local model server reachable","check":_chk_ollama,"fix":_fix_ollama,"required":True},
+      {"id":"model","name":"Local model installed","check":_chk_model,"fix":_fix_model,"required":True},
+      {"id":"api","name":"Online supervisor API keys","check":_chk_api,"fix":None,"required":False},
+      {"id":"pdf","name":"PDF extraction tool (pdftotext)","check":_chk_pdf,"fix":_fix_pdf,"required":False},
+      {"id":"img","name":"Image tools available (sips)","check":_chk_img,"fix":None,"required":True},
+      {"id":"roots","name":"Allowed working roots exist","check":_chk_roots,"fix":_fix_roots,"required":True},
     ]
     results=[]
     for s in steps:
@@ -1376,12 +1385,18 @@ def doctor(auto=False):
                 if fixed: ok=True; status="FIXED"; detail=msg or detail
                 else: status="NEEDS_ACTION"; detail=msg or detail
             except Exception as e: status="ERROR"; detail=str(e)
-        results.append({"id":s["id"],"name":s["name"],"status":status,"detail":detail})
-    all_ok=all(r["status"] in ("OK","FIXED") for r in results)
-    return {"all_ok":all_ok,"summary":{"ok":sum(1 for r in results if r["status"]=="OK"),"fixed":sum(1 for r in results if r["status"]=="FIXED"),"missing":sum(1 for r in results if r["status"] in ("MISSING","NEEDS_ACTION"))},"steps":results}
+        if not ok and not s.get("required",True): status="OPTIONAL"
+        results.append({"id":s["id"],"name":s["name"],"status":status,"detail":detail,"required":s.get("required",True)})
+    required=[r for r in results if r.get("required")]
+    all_ok=all(r["status"] in ("OK","FIXED") for r in required)
+    return {"all_ok":all_ok,"missing_required":[r["id"] for r in required if r["status"] not in ("OK","FIXED")],
+            "summary":{"ok":sum(1 for r in results if r["status"]=="OK"),"fixed":sum(1 for r in results if r["status"]=="FIXED"),
+                       "optional":sum(1 for r in results if r["status"]=="OPTIONAL"),
+                       "missing":sum(1 for r in required if r["status"] not in ("OK","FIXED"))},
+            "steps":results}
 
 def print_doctor(res):
-    marks={"OK":"[ OK ]","FIXED":"[FIXED]","MISSING":"[ !! ]","NEEDS_ACTION":"[ !! ]","ERROR":"[ ERR ]"}
+    marks={"OK":"[ OK ]","FIXED":"[FIXED]","MISSING":"[ !! ]","NEEDS_ACTION":"[ !! ]","ERROR":"[ ERR ]","OPTIONAL":"[ -- ]"}
     for s in res["steps"]:
         print(f"{marks.get(s['status'],'[ ? ]')} {s['name']}: {s.get('detail','')}")
     print("-"*46)
@@ -1510,7 +1525,11 @@ def main():
         if x.json: print(json.dumps(res,indent=2))
         elif x.report: print(json.dumps(doctor_report(x.report,res),indent=2))
         else: print_doctor(res)
-    elif x.cmd in ("install","setup"): print_doctor(doctor(True))
+    elif x.cmd in ("install","setup"):
+        os.environ["ALLOW_INSTALL"]="1"
+        res=doctor(True)
+        print_doctor(res)
+        if not res["all_ok"]: sys.exit(1)
     elif x.cmd=="health": print(json.dumps(HEALTH,indent=2))
     elif x.cmd=="discover": discover()
     elif x.cmd=="search": print(json.dumps(research(x.query,x.limit,x.fetch),indent=2))
