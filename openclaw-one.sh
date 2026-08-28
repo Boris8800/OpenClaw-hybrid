@@ -10,10 +10,10 @@ from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-ROOT = Path(os.getenv("OPENCLAW_HOME", str(Path.home() / "openclaw")))
+ROOT = Path(os.getenv("OPENCLAW_HOME", str(Path.home() / "OpenClawGeneral")))
 ROOT.mkdir(parents=True, exist_ok=True)
 DB_PATH = ROOT / "mempalace.sqlite3"
-DB = sqlite3.connect(DB_PATH, timeout=30)
+DB = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
 DB.execute("PRAGMA journal_mode=WAL")
 DB.execute("PRAGMA busy_timeout=30000")
 DB.execute("""CREATE TABLE IF NOT EXISTS memories(
@@ -66,7 +66,7 @@ def build_models():
     local_url=os.getenv("LOCAL_URL",os.getenv("OLLAMA_BASE_URL","")).strip()
     MODELS=[]
     if local_url:
-        MODELS.append({"name":LOCAL_MODEL_NAME,"url":local_url.rstrip("/"),"key":os.getenv("LOCAL_KEY",""),"weight":1,"provider":"local","kind":"local","role":"local_worker","context_window":int(os.getenv("LOCAL_CONTEXT_WINDOW","32768")),"tool_calls":True,"vision":True,"json_mode":True})
+        MODELS.append({"name":os.getenv("LOCAL_MODEL",LOCAL_MODEL_NAME),"url":local_url.rstrip("/"),"key":os.getenv("LOCAL_KEY",""),"weight":1,"provider":"local","kind":"local","role":"local_worker","context_window":int(os.getenv("LOCAL_CONTEXT_WINDOW","32768")),"tool_calls":True,"vision":os.getenv("LOCAL_VISION","0")=="1","json_mode":True})
     add_online(os.getenv("OPENAI_MODEL","gpt-4o-mini"),os.getenv("OPENAI_BASE_URL","https://api.openai.com/v1"),os.getenv("OPENAI_API_KEY",""),"openai")
     add_online(os.getenv("ANTHROPIC_MODEL","claude-3-5-haiku-latest"),os.getenv("ANTHROPIC_BASE_URL","https://api.anthropic.com/v1"),os.getenv("ANTHROPIC_API_KEY",""),"anthropic","anthropic")
     add_online(os.getenv("DEEPSEEK_MODEL","deepseek-chat"),os.getenv("DEEPSEEK_BASE_URL","https://api.deepseek.com/v1"),os.getenv("DEEPSEEK_API_KEY",""),"deepseek")
@@ -95,6 +95,26 @@ def log_event(event, **data):
     record={"time":time.strftime("%Y-%m-%d %H:%M:%S"),"event":event,**data}
     with ACTIVITY_FILE.open("a",encoding="utf-8") as f: f.write(json.dumps(record,ensure_ascii=False)+"\n")
 
+ERROR_FILE = ROOT / "errors.jsonl"
+def log_error(where, error, **data):
+    record={"time":time.strftime("%Y-%m-%d %H:%M:%S"),"where":where,"error":str(error),**data}
+    try:
+        with ERROR_FILE.open("a",encoding="utf-8") as f: f.write(json.dumps(record,ensure_ascii=False)+"\n")
+    except Exception: pass
+    log_event("error",where=where,error=str(error),**data)
+
+def read_errors(limit=100):
+    if not ERROR_FILE.exists(): return []
+    rows=[]
+    for line in ERROR_FILE.read_text(encoding="utf-8",errors="ignore").splitlines()[-limit:]:
+        try: rows.append(json.loads(line))
+        except Exception: pass
+    return rows
+
+def clear_errors():
+    if ERROR_FILE.exists(): ERROR_FILE.unlink()
+    log_event("errors_cleared"); return True
+
 def read_events(limit=100):
     if not ACTIVITY_FILE.exists(): return []
     rows=[]
@@ -117,6 +137,10 @@ def allowed_path(path, must_exist=False):
 
 def validate_response(data):
     if not isinstance(data,dict): raise ValueError("model response must be an object")
+    if data.get("error"):
+        err=data.get("error")
+        if isinstance(err,dict): err=err.get("message") or err.get("type") or json.dumps(err,ensure_ascii=False)
+        raise RuntimeError("model endpoint error: "+str(err))
     choices=data.get("choices")
     if not isinstance(choices,list) or not choices: raise ValueError("model response has no choices")
     message=choices[0].get("message",{}) if isinstance(choices[0],dict) else {}
@@ -163,10 +187,18 @@ def ingest_image(path, instruction="Describe this image and extract all readable
     p=Path(path).expanduser().resolve(); mime=mimetypes.guess_type(str(p))[0] or "image/jpeg"
     model=worker_model()
     if not model: raise RuntimeError("no worker model is configured")
+    if not model.get("vision"):
+        log_event("local_image_skipped",file=str(p),reason="no_vision_model")
+        return "(Image saved, but no vision-capable model is configured to analyze it. Set a vision model (e.g. llava/qwen2.5-vl) as the local worker to enable image description and OCR.)"
     encoded=base64.b64encode(p.read_bytes()).decode()
     payload={"model":model["name"],"messages":[{"role":"user","content":[{"type":"text","text":instruction},{"type":"image_url","image_url":{"url":f"data:{mime};base64,{encoded}"}}]}],"temperature":0.1,"max_tokens":int(os.getenv("LOCAL_VISION_TOKENS","1200"))}
-    log_event("local_image_analysis_started",file=str(p),model=model["name"]); result=request(model,payload)
-    text=result.get("choices",[{}])[0].get("message",{}).get("content",""); log_event("local_image_analysis_completed",file=str(p),characters=len(text)); return text
+    try:
+        log_event("local_image_analysis_started",file=str(p),model=model["name"]); result=request(model,payload)
+        text=result.get("choices",[{}])[0].get("message",{}).get("content","")
+    except Exception as e:
+        log_error("local_image_analysis_failed",e); log_event("local_image_analysis_failed",file=str(p),error=str(e)[:300])
+        return "(Image saved, but automatic analysis failed because the configured model cannot read images: "+str(e)+")"
+    log_event("local_image_analysis_completed",file=str(p),characters=len(text)); return text
 
 def ingest_file(path, category="document"):
     p=Path(path).expanduser().resolve(); ext=p.suffix.lower()
@@ -341,7 +373,7 @@ def dispatch_tool(name, args=None):
         if name=="memory_growth": return {"ok":True,"result":memory_growth()}
         if name=="html_report": return {"ok":True,"result":html_report(args.get("path"))}
         if name=="doctor_check": return {"ok":True,"result":doctor(bool(args.get("auto",False)))}
-    except Exception as e: log_event("tool_failed",tool=name,error=str(e)); return {"ok":False,"error":str(e)}
+    except Exception as e: log_event("tool_failed",tool=name,error=str(e)); log_error("tool:"+name,e); return {"ok":False,"error":str(e)}
 
 def safe_local_tool(name, argument=""):
     """Run read-only local tools only; never execute arbitrary shell text."""
@@ -564,6 +596,12 @@ def todo_done(tid):
     for x in data.get("items",[]):
         if x.get("id")==tid: x["done"]=True; save_todos(data); log_event("todo_done",todo_id=tid); return {"id":tid,"status":"done"}
     return {"error":"todo not found","id":tid}
+
+def todo_del(tid):
+    data=load_todos(); items=data.get("items",[])
+    kept=[x for x in items if x.get("id")!=tid]
+    if len(kept)==len(items): return {"error":"todo not found","id":tid}
+    data["items"]=kept; save_todos(data); log_event("todo_deleted",todo_id=tid); return {"ok":True,"id":tid}
 
 def note_append(path, text):
     fp=allowed_path(path); fp.parent.mkdir(parents=True,exist_ok=True)
@@ -860,7 +898,7 @@ def parse_tool_calls(text):
     return calls
 
 def detect_api_implementation_content(text):
-    suspicious=bool(re.search(r"```(?:python|javascript|typescript|bash|sh)|(?:complete|full) replacement file|subprocess\\.run|write_text\\(|git commit",text or "",re.I))
+    suspicious=bool(re.search(r"```(?:python|javascript|typescript|bash|sh)|(?:complete|full) replacement file|subprocess\.run|write_text\(|git commit",text or "",re.I))
     if suspicious: log_event("API_IMPLEMENTATION_CONTENT_DETECTED",authority="advisory_only")
     return suspicious
 
@@ -953,11 +991,18 @@ def general_agent(goal, conversation="agent", model=None, max_steps=4):
     plan="Inspect the project locally, implement the requested change, verify it independently, review evidence, and store only approved learning."
     if api_enabled:
         set_phase(task,"API_PLAN")
-        r=chat("Return JSON only with keys goal, acceptance_criteria, verification, risks, plan. Do not write code. TASK:\n"+goal,conversation=conversation,system="You are an API planning supervisor. Advisory analysis only; never write files, execute commands, or implement.",requested=PLAN_MODEL_NAME,max_tokens=int(os.getenv("DEEPSEEK_PLAN_TOKENS",str(adaptive_plan_tokens(goal)))),json_mode=True,use_memory=False)
-        plan=r.get("choices",[{}])[0].get("message",{}).get("content","")
-        task["api_plan_warning"]=detect_api_implementation_content(plan)
-        if task["api_plan_warning"]:
-            task["decision"]="REJECT"; task["rejection_reason"]="supervisor_attempted_implementation"; task["status"]="rejected"; save_task(task); return {"task":task,"answer":"Supervisor protocol violation during planning."}
+        try:
+            r=chat("Return JSON only with keys goal, acceptance_criteria, verification, risks, plan. Do not write code. TASK:\n"+goal,conversation=conversation,system="You are an API planning supervisor. Advisory analysis only; never write files, execute commands, or implement.",requested=PLAN_MODEL_NAME,max_tokens=int(os.getenv("DEEPSEEK_PLAN_TOKENS",str(adaptive_plan_tokens(goal)))),json_mode=True,use_memory=False)
+            plan=r.get("choices",[{}])[0].get("message",{}).get("content","")
+        except Exception as e:
+            # Supervisor unavailable (e.g. daily budget exhausted, key missing,
+            # network error): degrade to local-only instead of failing the agent.
+            log_event("supervisor_degraded",reason=str(e)[:200])
+            api_enabled=False
+        if api_enabled:
+            task["api_plan_warning"]=detect_api_implementation_content(plan)
+            if task["api_plan_warning"]:
+                task["decision"]="REJECT"; task["rejection_reason"]="supervisor_attempted_implementation"; task["status"]="rejected"; save_task(task); return {"task":task,"answer":"Supervisor protocol violation during planning."}
     task["plan"]=plan; save_task(task)
     worker_prompt=("You are the LOCAL WORKER and the only implementation authority. Inspect, edit, and test locally. Use tools through the local dispatcher. The API is advisory only and cannot implement. TASK:\n"+goal+"\nPLAN:\n"+plan+"\nMEMORY:\n"+json.dumps(memory,ensure_ascii=False)+"\nTOOLS:\n"+json.dumps(TOOL_REGISTRY))
     set_phase(task,"LOCAL_EXECUTION"); draft=local_worker_loop(worker_prompt,conversation=conversation,max_rounds=max_steps)
@@ -993,13 +1038,1332 @@ def general_agent(goal, conversation="agent", model=None, max_steps=4):
     else: log_event("mempalace_result_not_stored",reason=task.get("rejection_reason","not_approved"))
     save_task(task); return {"task":task,"answer":draft}
 
-DASHBOARD_HTML = '''<!doctype html><html><head><meta charset="utf-8"><title>OpenClaw Monitor</title><style>body{font:15px system-ui;background:#10141c;color:#e8edf5;margin:0}header{padding:18px 24px;background:#182131;position:sticky;top:0}h1{margin:0;font-size:21px}#status{color:#8fe3a1}.wrap{padding:18px 24px}.event{background:#192231;border:1px solid #2d3b50;border-radius:8px;padding:11px;margin:9px 0;white-space:pre-wrap}.time{color:#91a4bc}.kind{color:#7dd3fc;font-weight:600}</style></head><body><header><h1>OpenClaw Hybrid Agent Monitor</h1><div id="status">Live local activity</div></header><div class="wrap" id="events"></div><script>async function refresh(){let r=await fetch('/events');let a=await r.json();document.getElementById('events').innerHTML=a.reverse().map(x=>`<div class="event"><span class="time">${x.time}</span> <span class="kind">${x.event}</span><br>${JSON.stringify(x,null,2)}</div>`).join('')}refresh();setInterval(refresh,1200)</script></body></html>'''
+INBOX_FILE=ROOT/"inbox.json"
+def _load_inbox():
+    if not INBOX_FILE.exists(): return []
+    try: return json.loads(INBOX_FILE.read_text(encoding="utf-8"))
+    except Exception: return []
+def _save_inbox(items):
+    INBOX_FILE.write_text(json.dumps(items,indent=2,ensure_ascii=False),encoding="utf-8")
+def agent_inbox_add(goal, conversation="agent", steps=4):
+    goal=validate_goal(goal)
+    items=_load_inbox(); item={"id":str(uuid.uuid4()),"goal":goal,"conversation":conversation or "agent","steps":int(steps) or 4,"status":"queued","created":int(time.time()),"started":None,"finished":None,"result":None,"error":None}
+    items.append(item); _save_inbox(items)
+    log_event("agent_queued",task_id=item["id"],goal=goal[:200]); return item
+def agent_inbox_list():
+    items=_load_inbox()
+    return {"queued":sum(1 for x in items if x.get("status")=="queued"),
+            "running":sum(1 for x in items if x.get("status")=="running"),
+            "done":sum(1 for x in items if x.get("status")=="done"),
+            "failed":sum(1 for x in items if x.get("status")=="failed"),
+            "items":items[-50:]}
+def agent_inbox_retry(tid):
+    items=_load_inbox()
+    for x in items:
+        if x.get("id")==tid and x.get("status")=="failed":
+            x["status"]="queued"; x["error"]=None; x["started"]=None; x["finished"]=None; _save_inbox(items)
+            log_event("agent_retried",task_id=tid); return {"ok":True,"id":tid,"status":"queued"}
+    return {"error":"job not found or not failed","id":tid}
+def agent_worker():
+    """Background daemon: pulls queued goals and runs the general agent."""
+    while True:
+        try:
+            items=_load_inbox(); job=None
+            for x in items:
+                if x.get("status")=="queued": job=x; break
+            if not job:
+                time.sleep(2); continue
+            job["status"]="running"; job["started"]=int(time.time()); _save_inbox(items)
+            log_event("agent_started",task_id=job["id"])
+            try:
+                res=general_agent(job["goal"],job["conversation"],None,int(job["steps"]))
+                job["result"]=res.get("answer",""); job["status"]="done"
+            except Exception as e:
+                job["error"]=str(e); job["status"]="failed"; log_event("agent_failed",task_id=job["id"],error=str(e))
+            job["finished"]=int(time.time()); _save_inbox(items); time.sleep(1)
+        except Exception:
+            time.sleep(3)
+def start_agent_worker():
+    t=threading.Thread(target=agent_worker,daemon=True); t.start(); return t
+
+def run_all(web_port=8765):
+    """Start the web Control Center + background agent daemon together (non-blocking)."""
+    started=[]
+    if os.getenv("OPENCLAW_WEB_DISABLE","")!="1":
+        def _serve_web():
+            try: dashboard(int(web_port))
+            except Exception as e: log_event("dashboard_failed",error=str(e))
+        t=threading.Thread(target=_serve_web,daemon=True); t.start(); started.append(("web",t))
+    else:
+        print("[ web ] Control Center disabled (OPENCLAW_WEB_DISABLE=1)")
+    if os.getenv("OPENCLAW_AGENT_DISABLE","")!="1":
+        started.append(("agent",start_agent_worker()))
+    else:
+        print("[ agent ] background agent disabled (OPENCLAW_AGENT_DISABLE=1)")
+    return started
+
+FRONTEND_HTML = '''<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OpenClaw Control Center</title>
+<style>
+:root{
+  --bg:#0b0f17; --panel:#121826; --panel2:#161d2f; --line:#232c42;
+  --txt:#e8eefc; --muted:#8b97b1; --accent:#5b8cff; --accent2:#7dd3fc;
+  --ok:#37d67a; --warn:#f5b84b; --bad:#f26d6d; --code:#0d1117;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+html{font-size:var(--fs,14px)}
+body{margin:0;font:1rem/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;background:var(--bg);color:var(--txt)}
+a{color:var(--accent2);text-decoration:none}
+.layout{display:grid;grid-template-columns:230px 1fr;height:100vh}
+/* Sidebar */
+.side{background:var(--panel);border-right:1px solid var(--line);display:flex;flex-direction:column;min-height:0}
+.brand{padding:18px 18px 14px;border-bottom:1px solid var(--line)}
+.brand .logo{font-weight:800;font-size:1.143rem;letter-spacing:.4px;color:#fff}
+.brand .logo span{color:var(--accent2)}
+.brand .ver{color:var(--muted);font-size:0.786rem;margin-top:2px}
+.nav{padding:10px;flex:1;overflow:auto}
+.nav button{display:flex;align-items:center;gap:11px;width:100%;text-align:left;background:none;border:0;color:var(--muted);padding:10px 13px;border-radius:8px;margin-bottom:2px;font-size:1rem;cursor:pointer;transition:background .12s,color .12s}
+.nav button:hover{background:var(--panel2);color:var(--txt)}
+.nav button.active{background:rgba(91,140,255,.14);color:#fff}
+.nav button .ic{width:18px;text-align:center;opacity:.9;font-size:1.071rem}
+.side .foot{padding:12px 18px;border-top:1px solid var(--line);color:var(--muted);font-size:0.786rem}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--muted);margin-right:6px}
+.dot.ok{background:var(--ok)} .dot.bad{background:var(--bad)}
+/* Main */
+.main{overflow:auto;padding:22px 26px}
+.topbar{display:flex;align-items:center;gap:12px;margin-bottom:20px;flex-wrap:wrap}
+.topbar h1{font-size:1.286rem;margin:0}
+.topbar .spacer{flex:1}
+.icon-btn{background:var(--panel2);border:1px solid var(--line);color:var(--muted);width:32px;height:32px;border-radius:8px;cursor:pointer;font-size:1.071rem;display:inline-flex;align-items:center;justify-content:center}
+.icon-btn:hover{color:var(--txt);border-color:var(--accent)}
+.search-wrap{position:relative;min-width:220px;flex:1;max-width:360px}
+.search-wrap input{width:100%}
+.search-drop{position:absolute;top:calc(100% + 4px);left:0;right:0;background:var(--panel);border:1px solid var(--line);border-radius:8px;max-height:320px;overflow:auto;z-index:40;box-shadow:0 10px 30px rgba(0,0,0,.4)}
+.search-drop .sd-hd{padding:6px 10px;font-size:0.714rem;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
+.search-drop a{display:block;padding:8px 10px;font-size:0.857rem;color:var(--txt);border-top:1px solid var(--line)}
+.search-drop a:hover{background:var(--panel2)}
+.badge{font-size:0.786rem;padding:3px 9px;border-radius:20px;background:var(--panel2);border:1px solid var(--line);color:var(--muted)}
+.badge.on{color:var(--ok);border-color:rgba(55,214,122,.4)}
+.badge.err{color:var(--bad);border-color:rgba(242,109,109,.4)}
+.view{display:none;animation:fade .18s ease}
+.view.active{display:block}
+@keyframes fade{from{opacity:0;transform:translateY(4px)}to{opacity:1}}
+/* Cards */
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-bottom:20px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px}
+.card .label{color:var(--muted);font-size:0.786rem;text-transform:uppercase;letter-spacing:.5px}
+.card .val{font-size:1.714rem;font-weight:700;margin-top:6px}
+.card .val.small{font-size:1.143rem}
+.card .sub{color:var(--muted);font-size:0.857rem;margin-top:4px}
+/* Panels/tables */
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;margin-bottom:18px;overflow:hidden}
+.panel .hd{padding:12px 16px;border-bottom:1px solid var(--line);font-weight:600;font-size:0.929rem;display:flex;align-items:center;gap:8px}
+.panel.collapsible .hd{cursor:pointer;user-select:none}
+.panel.collapsible .hd:hover{background:var(--panel2)}
+.panel.collapsed .bd{display:none}
+.panel.collapsed .hd{border-bottom:0}
+.panel .bd{padding:14px 16px}
+table{width:100%;border-collapse:collapse;font-size:0.929rem}
+th,td{text-align:left;padding:8px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--muted);font-weight:600;font-size:0.786rem;text-transform:uppercase;letter-spacing:.5px}
+tr:last-child td{border-bottom:0}
+code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:0.857rem}
+pre{background:var(--code);border:1px solid var(--line);border-radius:8px;padding:12px;overflow:auto;white-space:pre-wrap;word-break:break-word}
+.chip{display:inline-block;font-size:0.786rem;padding:1px 8px;border-radius:12px;background:rgba(91,140,255,.15);color:var(--accent2);margin:1px}
+.model-badge{margin-left:6px;font-size:0.714rem;padding:1px 7px;text-transform:none;vertical-align:middle}
+.model-badge.online{background:rgba(245,184,75,.16);color:#f5b84b}
+.model-badge.local{background:rgba(55,214,122,.14);color:#37d67a}
+/* Buttons & inputs */
+.btn{background:var(--accent);border:0;color:#fff;padding:8px 16px;border-radius:8px;font-size:0.929rem;cursor:pointer;font-weight:600}
+.btn:hover{filter:brightness(1.08)}
+.btn.ghost{background:var(--panel2);border:1px solid var(--line);color:var(--txt);font-weight:500}
+.btn.sm{padding:5px 10px;font-size:0.857rem;margin-left:6px}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+input,select,textarea{background:var(--code);border:1px solid var(--line);color:var(--txt);border-radius:8px;padding:8px 10px;font-size:0.929rem;width:100%}
+textarea{resize:vertical;font-family:inherit}
+.field{margin-bottom:12px}
+.field label{display:block;color:var(--muted);font-size:0.786rem;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px}
+.row{display:flex;gap:12px;flex-wrap:wrap}.row>*{flex:1;min-width:140px}
+/* Event stream */
+.ev{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-bottom:8px}
+.ev .t{color:var(--muted);font-size:0.786rem}
+.ev .k{color:var(--accent2);font-weight:600}
+.ev .d{color:var(--muted);font-size:0.857rem;margin-top:2px}
+/* Chat */
+.chatbox{display:flex;flex-direction:column;gap:12px;height:58vh;min-height:440px;max-height:72vh;overflow-y:auto;padding:6px 4px 14px;scroll-behavior:smooth}
+.msg{display:flex;flex-direction:column;max-width:78%;padding:10px 14px 9px;border-radius:14px;font-size:0.929rem;white-space:pre-wrap;word-break:break-word;animation:msgIn .18s ease}
+@keyframes msgIn{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
+.msg.me{align-self:flex-end;background:linear-gradient(135deg,var(--accent),#5f7dff);color:#fff;border-bottom-right-radius:4px;box-shadow:0 2px 8px rgba(91,140,255,.25)}
+.msg.bot{align-self:flex-start;background:var(--panel2);border:1px solid var(--line);border-bottom-left-radius:4px;box-shadow:0 2px 8px rgba(0,0,0,.18)}
+.msg-top{display:flex;align-items:center;gap:8px;margin-bottom:5px}
+.msg .who{font-size:0.714rem;font-weight:700;letter-spacing:.6px;text-transform:uppercase;opacity:.85}
+.msg .ts{font-size:0.714rem;opacity:.55;margin-left:auto}
+.msg-body{line-height:1.5}
+.msg.me .msg-body a{color:#fff}
+.msg-foot{display:flex;align-items:center;gap:8px;margin-top:8px;opacity:.75}
+.msg-foot .msg-rev{margin-left:auto}
+.srcs{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.srcs a{font-size:0.786rem;color:var(--accent2);background:rgba(91,140,255,.12);border:1px solid var(--line);padding:3px 9px;border-radius:20px;text-decoration:none}
+.srcs a:hover{border-color:var(--accent)}
+.msg-rev{background:none;border:0;color:var(--muted);font-size:0.714rem;cursor:pointer;opacity:.8;text-transform:uppercase;letter-spacing:.4px}
+.msg-rev:hover{color:var(--accent2);opacity:1}
+.spin{display:inline-block;width:13px;height:13px;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:rot .7s linear infinite;vertical-align:-2px}
+@keyframes rot{to{transform:rotate(360deg)}}
+.composer{display:flex;gap:10px;align-items:flex-end;margin-top:14px;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:10px}
+.composer textarea{flex:1;border:0;background:transparent;resize:none;outline:none;font:inherit;color:var(--txt)}
+.composer textarea:focus{box-shadow:none}
+.chat-ctrl{display:flex;flex-direction:column;gap:8px;min-width:150px}
+.chat-ctrl select{font-size:0.857rem}
+#chat-send{align-self:stretch;border-radius:10px;padding:0 20px}
+.statusline{color:var(--muted);font-size:0.857rem}
+.toast{position:fixed;bottom:20px;right:20px;background:#1a2233;border:1px solid var(--line);border-left:3px solid var(--ok);border-radius:8px;padding:10px 16px;font-size:0.929rem;box-shadow:0 8px 24px rgba(0,0,0,.4);opacity:0;transform:translateY(8px);transition:.2s;z-index:50}
+.toast.show{opacity:1;transform:translateY(0)}
+.modal{position:fixed;inset:0;display:none;align-items:center;justify-content:center;z-index:60}
+.modal.open{display:flex}
+.modal-backdrop{position:absolute;inset:0;background:rgba(0,0,0,.55)}
+.modal-box{position:relative;width:min(720px,92vw);max-height:86vh;display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--line);border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.5)}
+.modal-hd{display:flex;align-items:center;gap:8px;padding:12px 16px;border-bottom:1px solid var(--line);font-weight:700}
+.modal-hd .btn{margin-left:auto}
+.modal-bd{padding:14px 16px;overflow-y:auto}
+.modal-ft{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 16px;border-top:1px solid var(--line)}
+.toast.err{border-left-color:var(--bad)}
+.empty{color:var(--muted);text-align:center;padding:24px;font-size:0.929rem}
+.termbox{background:#0a0e16;border:1px solid #1f2937;border-radius:8px;padding:10px 12px;font:12px/1.5 ui-monospace,Menlo,Consolas,monospace;color:#c9d4e6;height:420px;overflow:auto;white-space:pre-wrap;word-break:break-all}
+.term-line{min-height:1.5em}.term-line.cmd{color:#7dd3fc}.term-line.err{color:#fca5a5}.term-line.out{color:#d1d5db}.term-line.muted{color:#6b7280}
+::-webkit-scrollbar{width:10px;height:10px}::-webkit-scrollbar-thumb{background:#263048;border-radius:6px}
+/* Light theme */
+body.light{--bg:#f2f5fa;--panel:#ffffff;--panel2:#eef2f8;--line:#d8dfeb;--txt:#1c2436;--muted:#5b6b85;--accent:#3b6df0;--accent2:#0e7490;--code:#f7f9fd}
+body.light .termbox,body.light .msg.bot{background:#f7f9fd;border-color:#d8dfeb;color:#1c2436}
+body.light pre,body.light textarea,body.light input,body.light select{color:#1c2436}
+/* Responsive sidebar */
+@media(max-width:860px){
+  .layout{grid-template-columns:1fr}
+  .side{position:fixed;left:0;top:0;bottom:0;z-index:30;width:230px;transform:translateX(-100%);transition:transform .2s ease}
+  .side.open{transform:translateX(0);box-shadow:0 0 40px rgba(0,0,0,.5)}
+}
+/* Skeleton loading */
+.skeleton{position:relative;overflow:hidden;background:var(--panel2);border-radius:8px;min-height:14px}
+.skeleton::after{content:'';position:absolute;inset:0;background:linear-gradient(90deg,transparent,rgba(255,255,255,.08),transparent);animation:shimmer 1.2s infinite}
+@keyframes shimmer{from{transform:translateX(-100%)}to{transform:translateX(100%)}}
+/* Toast dismiss */
+.toast{display:flex;align-items:center;gap:10px}
+.toast .t-x{margin-left:auto;cursor:pointer;opacity:.7;font-weight:700}
+.toast .t-x:hover{opacity:1}
+</style></head>
+<body>
+<div class="layout">
+  <aside class="side">
+    <div class="brand">
+      <div class="logo">Open<span>Claw</span></div>
+      <div class="ver">Control Center</div>
+    </div>
+    <nav class="nav">
+      <button data-v="overview" class="active"><span class="ic">▦</span>Overview</button>
+      <button data-v="chat"><span class="ic">✎</span>Chat</button>
+      <button data-v="agent"><span class="ic">⚙</span>Agent Runner</button>
+      <button data-v="memory"><span class="ic">◍</span>Memory</button>
+      <button data-v="tools"><span class="ic">⊞</span>Tools</button>
+      <button data-v="terminal"><span class="ic">▸</span>Terminal</button>
+      <button data-v="system"><span class="ic">◎</span>System</button>
+      <button data-v="settings"><span class="ic">⚙</span>Settings</button>
+    </nav>
+    <div class="foot"><span class="dot" id="hd-dot"></span><span id="hd-status">connecting…</span></div>
+  </aside>
+
+  <main class="main">
+    <div class="topbar">
+      <button class="icon-btn" id="nav-toggle" title="Toggle sidebar">☰</button>
+      <h1 id="title">Overview</h1>
+      <div class="spacer"></div>
+      <div class="search-wrap" id="global-search-wrap">
+        <input type="text" id="global-search" placeholder="Search memories & to-dos… (Ctrl+K to chat)">
+        <div class="search-drop" id="global-results" hidden></div>
+      </div>
+      <span class="badge" id="badge-workers">models —</span>
+      <span class="badge" id="badge-time">—</span>
+      <button class="icon-btn" id="theme-toggle" title="Toggle theme">◐</button>
+      <button class="icon-btn" id="top-refresh" title="Refresh current view">⟳</button>
+    </div>
+
+    <!-- OVERVIEW -->
+    <section class="view active" id="view-overview">
+      <div class="cards">
+        <div class="card"><div class="label">Memories</div><div class="val" id="ov-mem">—</div><div class="sub" id="ov-mem-sub"></div></div>
+        <div class="card"><div class="label">Task status</div><div class="val small" id="ov-task">—</div><div class="sub" id="ov-task-sub"></div></div>
+        <div class="card"><div class="label">Worker model</div><div class="val small" id="ov-worker">—</div><div class="sub" id="ov-worker-sub"></div></div>
+        <div class="card"><div class="label">Activity events</div><div class="val" id="ov-activity">—</div><div class="sub">last 200 records</div></div>
+      </div>
+      <div class="cards" id="ov-resources" style="grid-template-columns:repeat(auto-fit,minmax(120px,1fr))"></div>
+      <div class="panel"><div class="hd">Providers</div><div class="bd">
+        <table><thead><tr><th>Model</th><th>Provider</th><th>Role</th><th>Context</th><th>Vision</th><th>Tool calls</th><th>Health</th></tr></thead><tbody id="ov-models"></tbody></table>
+      </div></div>
+      <div class="panel"><div class="hd">Recent activity <input type="text" id="ov-filter" placeholder="Filter events…" style="width:auto;margin-left:auto;max-width:220px"></div><div class="bd"><div id="ov-events"></div></div></div>
+    </section>
+
+    <!-- CHAT -->
+    <section class="view" id="view-chat">
+      <div class="panel"><div class="hd">Chat
+        <span class="statusline" style="margin-left:auto;margin-right:8px" id="chat-tools-status"></span>
+        <button class="btn ghost sm" id="chat-copy" title="Copy the conversation">⧉ Copy</button>
+        <button class="btn ghost sm" id="chat-dl" title="Download the conversation as text">↓ Download</button>
+        <button class="btn ghost sm" id="chat-clear" title="Clear the conversation" style="margin-left:8px">✕ Clear</button>
+      </div><div class="bd">
+        <div class="chatbox" id="chatbox"><div class="msg bot"><div class="msg-top"><span class="who">OpenClaw</span><span class="ts" id="welcome-ts"></span></div><div class="msg-body">Connected. Ask me anything — I'll route through the configured worker model.</div><div class="msg-foot"><button class="msg-rev" title="Reverse this message">↔ reverse</button></div></div></div>
+        <div class="composer">
+          <div class="chat-ctrl">
+            <select id="chat-mode">
+              <option value="auto">Auto · hybrid agent</option>
+              <option value="chat">Chat only</option>
+            </select>
+            <select id="chat-model"><option value="">default worker model</option></select>
+          </div>
+          <textarea id="chat-input" rows="2" placeholder="Type a message…"></textarea>
+          <button class="btn" id="chat-send">Send</button>
+        </div>
+        <div class="sub" id="chat-count" style="margin-top:4px;text-align:right"></div>
+      </div></div>
+
+      <div class="panel" id="chat-todos">
+        <div class="hd">To-dos <span class="statusline" style="margin-left:8px">quick list while you chat</span></div>
+        <div class="bd">
+          <div class="row">
+            <div style="flex:5"><input type="text" id="todo-text" placeholder="New to-do item…"></div>
+            <div class="field" style="flex:1"><input type="number" id="todo-pri" value="0"></div>
+            <div style="flex:0;display:flex;align-items:center;gap:6px">
+              <button class="btn" id="todo-add">Add</button>
+              <button class="btn ghost" id="todo-export">Export</button>
+            </div>
+          </div>
+          <div style="display:flex;align-items:center;margin:12px 0 8px">
+            <label style="display:flex;align-items:center;gap:6px;font-size:0.857rem;color:var(--muted);cursor:pointer"><input type="checkbox" id="todo-showdone" style="width:auto"> show done</label>
+          </div>
+          <div id="todo-list"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- AGENT -->
+    <section class="view" id="view-agent">
+      <div class="cards" id="agent-cards"></div>
+
+      <div class="panel"><div class="hd">Hybrid agent <span class="sub" style="margin-left:8px">local worker implements · API supervisor plans/reviews</span></div><div class="bd">
+        <div class="field"><label>Goal</label><textarea id="agent-goal" rows="3" placeholder="Describe the task for the hybrid agent to plan, implement and verify…"></textarea></div>
+        <div class="row">
+          <div class="field" style="flex:1"><label>Steps</label><input type="number" id="agent-steps" value="4" min="1" max="12"></div>
+          <div class="field" style="flex:1"><label>Conversation</label><input type="text" id="agent-conv" value="agent"></div>
+        </div>
+        <div class="row" style="gap:8px;align-items:center">
+          <button class="btn" id="agent-run">▶ Run hybrid agent now</button>
+          <button class="btn ghost" id="agent-queue">Queue in background</button>
+          <span class="statusline" id="agent-status" style="margin-left:auto"></span>
+        </div>
+      </div></div>
+
+      <div class="panel"><div class="hd">Live task state <span class="statusline" style="margin-left:auto" id="task-status"></span></div>
+        <div class="bd" id="task-panel"><div class="empty">no task state yet — run the hybrid agent</div></div>
+      </div>
+
+      <div class="panel"><div class="hd">Jobs <span class="statusline" style="margin-left:auto" id="agent-refresh"></span>
+        <button class="btn ghost" id="agent-clear-done" style="margin-left:8px">Clear done</button>
+      </div>
+        <div class="bd" id="agent-list"></div>
+      </div>
+    </section>
+
+    <!-- MEMORY -->
+    <section class="view" id="view-memory">
+      <div class="cards" id="mem-cards"></div>
+      <div class="panel"><div class="hd">Add memory</div><div class="bd">
+        <div class="field"><label>Text</label><textarea id="mem-text" rows="2" placeholder="Something worth remembering…"></textarea></div>
+        <div class="row">
+          <div class="field"><label>Category</label><input type="text" id="mem-cat" value="general"></div>
+          <div class="field"><label>Tags (comma)</label><input type="text" id="mem-tags" value=""></div>
+          <div class="field"><label>Importance (0–1)</label><input type="number" id="mem-imp" value="0.7" min="0" max="1" step="0.1"></div>
+        </div>
+        <button class="btn" id="mem-add">Add memory</button>
+        <button class="btn ghost" id="mem-export" style="margin-left:8px">Export</button>
+        <div class="field" style="margin-top:16px"><label>Add documents to memory (txt, md, pdf, docx, images…)</label>
+          <div class="row" style="align-items:center">
+            <input type="file" id="mem-files" multiple style="flex:3">
+            <button class="btn ghost" id="mem-upload" style="flex:0">Upload → memory</button>
+          </div>
+          <div class="statusline" id="mem-upload-status" style="margin-top:8px"></div>
+        </div>
+      </div></div>
+      <div class="panel"><div class="hd">Search <input type="text" id="mem-search-input" placeholder="Search memories…" style="width:auto;margin-left:auto;max-width:280px"></div>
+        <div class="bd" id="mem-list"></div>
+      </div>
+    </section>
+
+    <!-- TOOLS -->
+    <section class="view" id="view-tools">
+      <div class="panel"><div class="hd">Run a tool</div><div class="bd">
+        <div class="row">
+          <div class="field" style="flex:2"><label>Tool</label><select id="tool-run-name"></select></div>
+          <div class="field" style="flex:3"><label>Arguments (JSON)</label><input type="text" id="tool-run-args" placeholder='{"path":"."}'></div>
+          <div style="flex:0;display:flex;align-items:flex-end"><button class="btn" id="tool-run">Run</button></div>
+        </div>
+        <div class="statusline" id="tool-run-status" style="margin-top:8px"></div>
+        <pre id="tool-run-out" style="white-space:pre-wrap;font-size:0.857rem;color:var(--muted);margin-top:8px"></pre>
+        <button class="btn ghost sm" id="tool-copy" style="display:none">Copy output</button>
+      </div></div>
+      <div class="panel"><div class="hd">Local tool registry</div><div class="bd">
+        <table><thead><tr id="tool-list-head"><th data-sort="name" style="cursor:pointer">Tool ⇅</th><th data-sort="description" style="cursor:pointer">Description ⇅</th><th data-sort="authority" style="cursor:pointer">Authority ⇅</th></tr></thead><tbody id="tool-list"></tbody></table>
+      </div></div>
+    </section>
+
+    <!-- TERMINAL -->
+    <section class="view" id="view-terminal">
+      <div class="panel"><div class="hd">Terminal <span class="statusline" style="margin-left:auto" id="term-status"></span></div>
+        <div class="bd">
+          <div class="termbox" id="term-out"><div class="term-line">OpenClaw web terminal — commands run under LOCAL_TERMINAL_POLICY.</div></div>
+          <div class="row" style="margin-top:8px;align-items:center">
+            <div style="flex:1;display:flex">
+              <span style="color:var(--muted);margin-right:6px" id="term-cwd">~/</span>
+              <input type="text" id="term-input" placeholder="type a command and press Enter…" autocomplete="off" spellcheck="false" style="flex:1">
+            </div>
+            <div style="flex:0;margin-left:8px;display:flex;align-items:center;gap:6px">
+              <button class="btn" id="term-run">Run</button>
+              <button class="btn ghost" id="term-clear">Clear</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- SYSTEM -->
+    <section class="view" id="view-system">
+      <div class="cards" id="sys-cards"></div>
+      <div class="panel"><div class="hd">Actions
+        <button class="btn ghost sm" id="sys-backup" style="margin-left:auto">Create backup</button>
+      </div><div class="bd"><div class="statusline" id="sys-backup-status"></div></div></div>
+      <div class="panel"><div class="hd">Environment</div><div class="bd"><pre id="sys-env">—</pre></div></div>
+      <div class="panel"><div class="hd">Error log <span class="statusline" style="margin-left:auto" id="err-status"></span>
+        <button class="btn ghost" id="err-clear" style="margin-left:8px">Clear log</button>
+      </div>
+        <div class="bd" id="err-list"><div class="empty">loading…</div></div>
+      </div>
+    </section>
+
+    <!-- SETTINGS -->
+    <section class="view" id="view-settings">
+      <div class="cards" id="set-cards"></div>
+      <div class="panel"><div class="hd">Interface</div><div class="bd">
+        <div class="row">
+          <div class="field" style="flex:2"><label>Font size</label>
+            <div style="display:flex;align-items:center;gap:10px">
+              <input type="range" id="set-font-size" min="10" max="24" step="1" value="14" style="flex:1">
+              <span class="chip" id="font-size-val" style="min-width:44px;text-align:center">14px</span>
+              <button class="btn ghost sm" id="font-size-reset" title="Reset to 14px">↺</button>
+            </div>
+            <div class="sub" style="color:var(--muted);margin-top:4px">Adjust the Control Center text size (saved in your browser).</div>
+          </div>
+        </div>
+      </div></div>
+      <div class="panel"><div class="hd">Local provider (Ollama / LM Studio / vLLM / llama.cpp)</div><div class="bd">
+        <div class="row">
+          <div class="field" style="flex:3"><label>Endpoint URL</label><input type="text" id="set-local-url" placeholder="http://127.0.0.1:11434/v1"></div>
+          <div class="field" style="flex:2"><label>Model name</label><input type="text" id="set-local-model" placeholder="qwen2.5-coder:14b"></div>
+          <div class="field" style="flex:2"><label>Context window</label><input type="text" id="set-local-ctx" placeholder="32768"></div>
+        </div>
+        <div class="field"><label>API key (only if your local server requires one)</label><input type="password" id="set-local-key" placeholder="leave blank if not required"></div>
+      </div></div>
+
+      <div class="panel"><div class="hd">OpenAI</div><div class="bd">
+        <div class="field"><label>API key <span class="statusline" id="set-openai-set"></span></label><input type="password" id="set-openai-key" placeholder="sk-..."></div>
+        <div class="row">
+          <div class="field"><label>Model</label><input type="text" id="set-openai-model" placeholder="gpt-4o-mini"></div>
+          <div class="field"><label>Base URL</label><input type="text" id="set-openai-base" placeholder="https://api.openai.com/v1"></div>
+        </div>
+      </div></div>
+
+      <div class="panel"><div class="hd">Anthropic (Claude)</div><div class="bd">
+        <div class="field"><label>API key <span class="statusline" id="set-anthropic-set"></span></label><input type="password" id="set-anthropic-key" placeholder="sk-ant-..."></div>
+        <div class="row">
+          <div class="field"><label>Model</label><input type="text" id="set-anthropic-model" placeholder="claude-3-5-haiku-latest"></div>
+          <div class="field"><label>Base URL</label><input type="text" id="set-anthropic-base" placeholder="https://api.anthropic.com/v1"></div>
+        </div>
+      </div></div>
+
+      <div class="panel"><div class="hd">DeepSeek</div><div class="bd">
+        <div class="field"><label>API key <span class="statusline" id="set-deepseek-set"></span></label><input type="password" id="set-deepseek-key" placeholder="sk-..."></div>
+        <div class="row">
+          <div class="field"><label>Model</label><input type="text" id="set-deepseek-model" placeholder="deepseek-chat"></div>
+          <div class="field"><label>Base URL</label><input type="text" id="set-deepseek-base" placeholder="https://api.deepseek.com/v1"></div>
+        </div>
+      </div></div>
+
+      <div class="panel" id="set-presets-trigger" style="cursor:pointer" title="Double-click to open">
+        <div class="hd">Preset settings <span class="statusline" style="margin-left:auto">double-click to open</span></div>
+        <div class="bd" style="color:var(--muted);font-size:0.857rem">System prompt, temperature, context window, terminal policy, supervisor, memory and security presets…</div>
+      </div>
+
+      <div class="panel"><div class="hd">Actions</div><div class="bd">
+        <button class="btn" id="set-save">Save &amp; reload models</button>
+        <span class="statusline" id="set-status" style="margin-left:12px"></span>
+      </div></div>
+
+      <div class="panel"><div class="hd">Active providers</div><div class="bd">
+        <table><thead><tr><th>Model</th><th>Provider</th><th>Role</th></tr></thead><tbody id="set-models"></tbody></table>
+      </div></div>
+    </section>
+  </main>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<!-- Preset settings modal -->
+<div class="modal" id="preset-modal">
+  <div class="modal-backdrop" id="preset-backdrop"></div>
+  <div class="modal-box">
+    <div class="modal-hd">Preset settings
+      <button class="btn ghost sm" id="preset-close" title="Close">✕</button>
+    </div>
+    <div class="modal-bd" id="set-presets"><div class="empty">loading…</div></div>
+    <div class="modal-ft">
+      <span class="statusline" id="preset-status"></span>
+      <button class="btn" id="preset-save">Save &amp; reload models</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const $=s=>document.querySelector(s);
+const esc=t=>String(t).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+function toast(msg,err){const t=$('#toast');t.innerHTML=esc(msg)+'<span class="t-x" data-x>×</span>';t.className='toast show'+(err?' err':'');clearTimeout(t._h);t._h=setTimeout(()=>t.className='toast',2600)}
+async function api(path,opts){let r;try{r=await fetch(path,opts);}catch(e){throw new Error('cannot reach control server — is it running? ('+e.message+')')}let j={};try{j=await r.json()}catch(e){j={}}if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j}
+const post=(path,body)=>api(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+
+/* navigation */
+const TITLES={overview:'Overview',chat:'Chat',agent:'Agent Runner',memory:'Memory',tools:'Tools',terminal:'Terminal',system:'System',settings:'Settings'};
+let cur='overview';
+function showView(v){document.querySelectorAll('.nav button').forEach(x=>x.classList.toggle('active',x.dataset.v===v));cur=v;
+  document.querySelectorAll('.view').forEach(x=>x.classList.toggle('active',x.id==='view-'+v));
+  $('#title').textContent=TITLES[v]||v;
+  if(v==='memory')loadMemStats();if(v==='tools')loadTools();if(v==='system')loadSystem();if(v==='settings')loadSettings();if(v==='agent')loadAgent();
+  if(v==='terminal'){loadTerminal();$('#term-input').focus();}
+  if(v==='chat'){loadTodos();$('#chat-input').focus();}
+  const side=$('.side');if(side)side.classList.remove('open');}
+document.querySelectorAll('.nav button').forEach(b=>b.addEventListener('click',()=>showView(b.dataset.v)));
+
+/* theme + sidebar + shortcuts */
+function applyTheme(t){document.body.classList.toggle('light',t==='light');const b=$('#theme-toggle');if(b)b.textContent=t==='light'?'☾':'◐';try{localStorage.setItem('oc-theme',t)}catch(e){}}
+function toggleTheme(){const t=document.body.classList.contains('light')?'dark':'light';applyTheme(t);}
+function initTheme(){let t='dark';try{t=localStorage.getItem('oc-theme')||'dark'}catch(e){}applyTheme(t);}
+function applyFontSize(size){
+  size=parseInt(size,10);if(!(size>=10&&size<=24))size=14;
+  document.body.style.setProperty('--fs',size+'px');
+  const s=$('#set-font-size');if(s)s.value=size;
+  const b=$('#font-size-val');if(b)b.textContent=size+'px';
+  try{localStorage.setItem('oc-font-size',String(size))}catch(e){}
+}
+function initFontSize(){let s=14;try{s=parseInt(localStorage.getItem('oc-font-size')||'14',10)}catch(e){}applyFontSize(s);}
+$('#nav-toggle').addEventListener('click',()=>$('.side').classList.toggle('open'));
+$('#theme-toggle').addEventListener('click',toggleTheme);
+$('#set-font-size').addEventListener('input',e=>applyFontSize(e.target.value));
+$('#font-size-reset').addEventListener('click',()=>{applyFontSize(14);toast('Font size reset to 14px');});
+document.addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&e.key==='k'){e.preventDefault();showView('chat');setTimeout(()=>$('#chat-input').focus(),50);}});
+$('#theme-toggle').title='Toggle dark / light theme';
+
+/* relative time */
+function rel(ts){if(!ts)return '—';const d=typeof ts==='number'?new Date(ts*1000):new Date(ts);if(isNaN(d))return String(ts);
+  const s=Math.round((Date.now()-d.getTime())/1000);
+  if(s<5)return 'just now';if(s<60)return s+'s ago';if(s<3600)return Math.round(s/60)+'m ago';if(s<86400)return Math.round(s/3600)+'h ago';if(s<604800)return Math.round(s/86400)+'d ago';
+  return d.toLocaleDateString();}
+function fmtTime(ts){if(!ts)return '—';const d=typeof ts==='number'?new Date(ts*1000):new Date(ts);if(isNaN(d))return String(ts);return rel(ts);}
+
+/* global search */
+let gsTimer;
+async function globalSearch(){
+  const q=($('#global-search').value||'').trim();const drop=$('#global-results');const wrap=$('#global-search-wrap');
+  if(!q){drop.hidden=true;return;}
+  try{
+    const [mem,todos]=await Promise.all([api('/api/memory/search?q='+encodeURIComponent(q)+'&limit=6').catch(()=>({})),api('/api/todos').catch(()=>({items:[]}))]);
+    const mems=mem||[];const todoItems=(todos.items||[]).filter(t=>(t.text||'').toLowerCase().includes(q.toLowerCase())).slice(0,6);
+    let h='';
+    if(mems.length){h+='<div class="sd-hd">Memories</div>'+mems.map(m=>'<a href="#" data-go="memory" data-q="'+esc(q)+'">'+esc(m.category)+' · '+esc((m.text||'').slice(0,70))+'</a>').join('');}
+    if(todoItems.length){h+='<div class="sd-hd">To-dos</div>'+todoItems.map(t=>'<a href="#" data-go="chat" data-todo="'+esc(t.id)+'">☑ '+esc((t.text||'').slice(0,70))+'</a>').join('');}
+    if(!h)h='<div class="sd-hd">No results</div>';
+    drop.innerHTML=h;drop.hidden=false;
+    drop.querySelectorAll('a[data-go]').forEach(a=>a.addEventListener('click',ev=>{ev.preventDefault();drop.hidden=true;$('#global-search').value='';if(a.dataset.go==='memory'){showView('memory');setTimeout(()=>{const si=$('#mem-search-input');if(si){si.value=q;loadMem(q);}},80);}else{showView('chat');setTimeout(()=>{const p=$('#chat-todos');if(p)p.scrollIntoView({behavior:'smooth',block:'start'});},80);}}));
+  }catch(e){drop.hidden=true;}
+}
+$('#global-search').addEventListener('input',()=>{clearTimeout(gsTimer);gsTimer=setTimeout(globalSearch,250);});
+$('#global-search').addEventListener('focus',()=>{if(($('#global-search').value||'').trim())globalSearch();});
+document.addEventListener('click',e=>{if(!e.target.closest('#global-search-wrap'))$('#global-results').hidden=true;});
+
+/* collapsible panels */
+function wireCollapse(scope){
+  (scope||document).querySelectorAll('.panel > .hd').forEach(hd=>{
+    if(hd.querySelector('button,input,select'))return;
+    const p=hd.parentElement;if(p.classList.contains('collapsible'))return;
+    p.classList.add('collapsible');
+    hd.addEventListener('click',()=>p.classList.toggle('collapsed'));
+  });
+}
+
+/* resources card */
+async function loadResources(){
+  const el=$('#ov-resources');if(!el)return;
+  try{
+    const r=await api('/api/system/resources');
+    const cells=[
+      ['CPU',r.cpu_percent!=null?r.cpu_percent+'%':'—'],
+      ['Memory',r.mem_percent!=null?r.mem_percent+'%':'—'],
+      ['Mem used',r.mem_used_mb?Math.round(r.mem_used_mb/1024)+' GB':'—'],
+      ['Disk',r.disk_percent!=null?r.disk_percent+'%':'—'],
+      ['Disk free',(r.disk_total_gb!=null&&r.disk_used_gb!=null)?Math.round(r.disk_total_gb-r.disk_used_gb)+' GB':'—']
+    ];
+    el.innerHTML=cells.map(c=>`<div class="card"><div class="label">${c[0]}</div><div class="val small">${c[1]}</div></div>`).join('');
+  }catch(e){el.innerHTML='';}
+}
+
+/* agent completion notifications */
+let _notifPrevRunning=new Set();
+async function checkAgentNotify(){
+  try{
+    const j=await api('/api/agent/status');
+    const running=new Set((j.items||[]).filter(x=>x.status==='running').map(x=>x.id));
+    (j.items||[]).forEach(x=>{
+      if(_notifPrevRunning.has(x.id)&&x.status!=='running'){
+        try{new Notification('OpenClaw agent '+x.status,{body:(x.goal||'').slice(0,120)})}catch(e){}
+      }
+    });
+    _notifPrevRunning=running;
+  }catch(e){}
+}
+function initNotify(){try{Notification.requestPermission()}catch(e){}}
+setInterval(checkAgentNotify,4000);
+
+/* copy helper */
+function copyText(txt){if(navigator.clipboard){navigator.clipboard.writeText(txt).then(()=>toast('copied')).catch(()=>{});}else{toast('copy not supported');}}
+function wireCopy(scope){
+  (scope||document).querySelectorAll('[data-copy]').forEach(b=>b.addEventListener('click',()=>copyText(b.dataset.copy||'')));
+}
+
+/* refresh current view */
+function refreshView(){
+  if(cur==='overview')loadOverview();if(cur==='memory')loadMemStats();
+  if(cur==='tools')loadTools();if(cur==='system')loadSystem();if(cur==='settings')loadSettings();if(cur==='agent'){loadAgent();loadTask();}
+  if(cur==='chat')loadTodos();
+  toast('refreshed');
+}
+$('#top-refresh').addEventListener('click',refreshView);
+$('#theme-toggle').addEventListener('dblclick',()=>{$('#global-search').focus();});
+document.addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&e.shiftKey&&(e.key==='F'||e.key==='f')){e.preventDefault();$('#global-search').focus();}});
+
+
+
+/* overview */
+async function loadOverview(){
+  try{
+    const [mem,events,task,health,hrep]=await Promise.all([api('/api/memory/stats'),api('/api/events?limit=40'),api('/api/task'),api('/api/system'),api('/api/health').catch(()=>({}))]);
+    $('#ov-mem').textContent=mem.total;
+    const top=Object.entries(mem.by_category||{}).sort((a,b)=>b[1]-a[1]).slice(0,3).map(([k,v])=>k+':'+v).join(' · ');
+    $('#ov-mem-sub').textContent=top||'no categories yet';
+    $('#ov-activity').textContent=events.events.length;
+    const t=task;
+    if(t&&t.status){$('#ov-task').textContent=t.status;$('#ov-task-sub').textContent=(t.phase||'')+' · attempt '+(t.attempt||0);}
+    else{$('#ov-task').textContent='none';$('#ov-task-sub').textContent='no task running';}
+    $('#ov-worker').textContent=health.config.worker_model||'—';
+    $('#ov-worker-sub').textContent=(health.config.supervisor_model||'supervisor not set');
+    const hmodels=(hrep.models||{});
+    const mrows=(health.config.models||[]).map(m=>{
+      const h=hmodels[m.name]||{};
+      let badge='';
+      if(h.cooldown_until&&h.cooldown_until>Date.now()/1000)badge='<span class="badge err">cooldown</span>';
+      else if(h.failures>0)badge='<span class="badge err">'+h.failures+' fail</span>';
+      else if(h.successes>0)badge='<span class="badge on">ok</span>';
+      return `<tr><td>${esc(m.name)}</td><td>${esc(m.provider)}</td><td>${esc(m.role)}</td><td>${esc(m.context_window||'—')}</td><td>${m.vision?'✓':'—'}</td><td>${m.tool_calls?'✓':'—'}</td><td>${badge}</td></tr>`;
+    }).join('');
+    $('#ov-models').innerHTML=mrows||'<tr><td colspan="7" class="empty">no models configured</td></tr>';
+    window._ovEvents=events.events.slice().reverse();
+    renderOverviewEvents();
+    $('#badge-workers').textContent='models '+(health.config.models||[]).length;
+  }catch(e){toast('Overview failed: '+e.message,true)}
+}
+function renderOverviewEvents(){
+  const q=($('#ov-filter').value||'').toLowerCase();
+  const list=(window._ovEvents||[]).filter(e=>!q||(e.event||'').toLowerCase().includes(q)||JSON.stringify(e).toLowerCase().includes(q));
+    $('#ov-events').innerHTML=list.map(e=>`<div class="ev"><span class="t">${esc(e.time)}</span> <span class="k">${esc(e.event)}</span><div class="d">${esc(JSON.stringify({...e,time:undefined,event:undefined}))}</div></div>`).join('')||'<div class="empty">no matching events</div>';
+    wireCollapse();loadResources();
+}
+
+/* errors */
+async function loadErrors(){
+  try{
+    const j=await api('/api/errors?limit=100');
+    const list=j.errors||[];
+    const rows=list.slice().reverse().map(e=>{
+      const extra=JSON.stringify({...(e||{}),time:undefined,where:undefined,error:undefined})||'';
+      const dataStr=extra!=='{}'?` <span class="t">${esc(extra)}</span>`:'';
+      return `<div class="ev"><span class="t">${esc(e.time||'—')}</span> <span class="k" style="color:var(--bad)">${esc(e.where||'?')}</span><div class="d"><span style="color:var(--bad)">${esc(e.error||'')}</span>${dataStr} <button class="btn ghost sm" data-copy="${esc(e.error||'')}">copy</button></div></div>`;
+    }).join('');
+    $('#err-list').innerHTML=rows||'<div class="empty">no errors — nice</div>';
+    $('#err-list').querySelectorAll('[data-copy]').forEach(b=>b.addEventListener('click',()=>copyText(b.dataset.copy||'')));
+    $('#err-status').textContent=list.length+' shown';
+  }catch(e){$('#err-list').innerHTML='<div class="empty">failed to load error log</div>';$('#err-status').textContent='error';}
+}
+async function clearErrors(){
+  try{await post('/api/errors',{});toast('Error log cleared');loadErrors();}catch(e){toast(e.message,true);}
+}
+
+/* chat */
+async function loadModels(sel){
+  try{
+    const el=$(sel);if(!el)return;
+    const j=await api('/api/system');const models=j.config.models||[];
+    const worker=j.config.worker_model||'';
+    const opts=models.map(m=>{
+      const tag=m.role==='local_worker'?'local worker':(m.role||'model');
+      return `<option value="${esc(m.name)}">${esc(m.name)} (${esc(tag)})${m.name===worker?' · default':''}</option>`;
+    }).join('');
+    el.innerHTML='<option value="">default worker · '+esc(worker||'none')+'</option>'+opts;
+  }catch(e){}
+}
+async function sendChat(){
+  const input=$('#chat-input');const text=input.value.trim();if(!text)return;
+  const box=$('#chatbox');
+  const history=chatHistory();
+  box.insertAdjacentHTML('beforeend',`<div class="msg me"><div class="msg-top"><span class="who">You</span><span class="ts">${chatTs()}</span></div><div class="msg-body">${esc(text)}</div><div class="msg-foot"><button class="msg-rev" title="Reverse this message">↔ reverse</button></div></div>`);
+  const model=$('#chat-model').value||null;
+  const mode=$('#chat-mode').value||'auto';
+  box.insertAdjacentHTML('beforeend',`<div class="msg bot" id="thinking"><div class="msg-top"><span class="who">OpenClaw</span><span class="ts">${chatTs()}</span></div><div class="msg-body"><span class="spin"></span> thinking…</div><div class="msg-foot"><button class="msg-rev" title="Reverse this message">↔ reverse</button></div></div>`);
+  input.value='';box.scrollTop=box.scrollHeight;
+  const btn=$('#chat-send');btn.disabled=true;
+  try{
+    const j=await post('/api/chat',{prompt:text,conversation:'web',model,mode,history});
+    const srcs=(j.sources||[]).filter(s=>s&&s.url);
+    const srcHtml=srcs.length?`<div class="srcs">${srcs.map(s=>`<a href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.title||s.url)}</a>`).join('')}</div>`:'';
+    const mdl=j.model||'';const prov=j.provider||'';const role=j.role||'';
+    const online=!!role&&role!=='local_worker';
+    const badge=mdl?`<span class="chip model-badge ${online?'online':'local'}" title="${esc(prov||'')}${online?' · online API':''}">${esc(mdl)}${online?' ●':''}</span>`:'';
+    $('#thinking').outerHTML=`<div class="msg bot"><div class="msg-top"><span class="who">OpenClaw ${badge}</span><span class="ts">${chatTs()}</span></div><div class="msg-body">${esc(j.answer||'')}</div>${srcHtml}<div class="msg-foot"><button class="msg-rev" title="Reverse this message">↔ reverse</button></div></div>`;
+  }catch(e){$('#thinking').outerHTML=`<div class="msg bot"><div class="msg-top"><span class="who">OpenClaw</span><span class="ts">${chatTs()}</span></div><div class="msg-body"><span style="color:var(--bad)">error: ${esc(e.message)}</span></div><div class="msg-foot"><button class="msg-rev" title="Reverse this message">↔ reverse</button></div></div>`;}
+  finally{btn.disabled=false;box.scrollTop=box.scrollHeight;}
+}
+
+/* chat tools */
+function chatTs(){try{return new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});}catch(e){return '';}}
+function chatHistory(){
+  const arr=[];
+  document.querySelectorAll('#chatbox .msg').forEach(m=>{
+    if(m.id==='thinking')return;
+    const body=m.querySelector('.msg-body');
+    const txt=(body?body.innerText:'').trim();
+    if(!txt)return;
+    if(txt.indexOf('Connected.')===0||txt.indexOf('Chat cleared.')===0)return;
+    if(/^thinking…/i.test(txt))return;
+    const role=m.classList.contains('me')?'user':'assistant';
+    arr.push({role,content:txt});
+  });
+  return arr;
+}
+function chatMsgs(){
+  return Array.from(document.querySelectorAll('#chatbox .msg')).map(m=>{
+    const who=m.querySelector('.who');
+    const body=m.querySelector('.msg-body');
+    const txt=(body?body.innerText:'').trim();
+    return (who?who.textContent.trim()+': ':'')+txt;
+  });
+}
+function chatTranscript(){
+  return chatMsgs().join('\\n\\n')||'(empty chat)';
+}
+function chatStatus(msg){const el=$('#chat-tools-status');if(el){el.textContent=msg;clearTimeout(el._h);el._h=setTimeout(()=>el.textContent='',2200);}}
+function reverseMsg(btn){
+  const box=$('#chatbox');if(!box)return;
+  const msg=btn.closest('.msg');if(!msg)return;
+  const msgs=Array.from(box.querySelectorAll('.msg'));
+  const idx=msgs.indexOf(msg);
+  if(idx<0)return;
+  const removed=msgs.length-idx;
+  if(removed<=0)return;
+  if(removed>1 && !confirm('Roll back the conversation to this point? '+removed+' message(s) after it will be removed.'))return;
+  // Remove the clicked message and everything after it (revert to this point).
+  msgs.slice(idx).forEach(m=>m.remove());
+  // Drop any lingering "thinking" placeholder.
+  const th=box.querySelector('#thinking');if(th)th.remove();
+  // Keep the welcome message if everything was removed.
+  if(!box.querySelector('.msg')){
+    box.insertAdjacentHTML('beforeend','<div class="msg bot"><div class="msg-top"><span class="who">OpenClaw</span><span class="ts">'+chatTs()+'</span></div><div class="msg-body">Connected. Ask me anything — I will route through the configured worker model.</div><div class="msg-foot"><button class="msg-rev" title="Reverse this message">↔ reverse</button></div></div>');
+  }
+  box.scrollTop=box.scrollHeight;
+  chatStatus('↔ rolled back to this point');
+  updateChatCount();
+}
+function copyChat(){
+  const txt=chatTranscript();
+  (navigator.clipboard?navigator.clipboard.writeText(txt):Promise.reject()).then(()=>chatStatus('copied '+chatMsgs().length+' messages')).catch(()=>{prompt('Copy manually:',txt);chatStatus('copy ready');});
+}
+function downloadChat(){
+  const txt=chatTranscript();
+  const blob=new Blob([txt],{type:'text/plain'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='openclaw-chat-'+new Date().toISOString().slice(0,10)+'.txt';
+  document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(a.href);
+  chatStatus('downloaded');
+}
+function clearChat(){
+  const box=$('#chatbox');
+  box.innerHTML='<div class="msg bot"><div class="msg-top"><span class="who">OpenClaw</span><span class="ts">'+chatTs()+'</span></div><div class="msg-body">Chat cleared. Ask me anything.</div><div class="msg-foot"><button class="msg-rev" title="Reverse this message">↔ reverse</button></div></div>';
+  chatStatus('cleared');
+}
+function updateChatCount(){
+  const el=$('#chat-count');const v=$('#chat-input').value;
+  if(!el)return;
+  const words=v.trim()?v.trim().split(/[ \\t\\n\\r]+/).filter(Boolean).length:0;
+  const chars=v.length;const tokens=Math.ceil(chars/4);
+  el.textContent=chars+' chars · '+words+' words · ~'+tokens+' tokens';
+}
+$('#chatbox').addEventListener('click',e=>{const b=e.target.closest('.msg-rev');if(b)reverseMsg(b);});
+$('#chat-copy').addEventListener('click',copyChat);
+$('#chat-dl').addEventListener('click',downloadChat);
+$('#chat-clear').addEventListener('click',clearChat);
+$('#chat-input').addEventListener('input',updateChatCount);
+
+/* agent */
+let agentTimer,taskTimer;
+async function submitAgent(runNow){
+  const goal=$('#agent-goal').value.trim();if(!goal){toast('Enter a goal',true);return;}
+  $('#agent-run').disabled=true;$('#agent-status').textContent='submitting…';
+  try{
+    const j=await post('/api/agent/queue',{goal,conversation:$('#agent-conv').value||'agent',steps:parseInt($('#agent-steps').value)||4});
+    $('#agent-goal').value='';
+    $('#agent-status').textContent=(runNow?'running':'queued')+' · '+j.status;
+    toast(runNow?'Hybrid agent started':'Goal queued for the hybrid agent');
+    if(runNow){$('#view-agent').scrollIntoView({behavior:'smooth',block:'start'});}
+    loadAgent();loadTask();
+  }catch(e){$('#agent-status').textContent='error: '+e.message;toast(e.message,true);}
+  finally{$('#agent-run').disabled=false;}
+}
+function jobHtml(x){
+  const stCls=x.status==='done'?'var(--ok)':x.status==='failed'?'var(--bad)':x.status==='running'?'var(--accent2)':'var(--muted)';
+  const dur=(x.finished&&x.started)?(' · '+Math.round(x.finished-x.started)+'s'):'';
+  const body=x.status==='done'?esc((x.result||'').slice(0,400)):(x.error?`<span style="color:var(--bad)">${esc(x.error)}</span>`:'');
+  const full=x.status==='done'?esc(x.result||''):'';
+  const retry=x.status==='failed'?` <button class="btn ghost sm" data-retry="${esc(x.id)}">retry</button>`:'';
+  return `<div class="ev"><span class="k" style="color:${stCls}">${esc(x.status)}</span> <span class="t">${fmtTime(x.created)}</span>${dur} · ${esc(x.goal)}${retry}
+    <div class="d">${body||'<span style="color:var(--muted)">(no output)</span>'}</div>
+    ${full?`<details><summary>full result</summary><pre style="white-space:pre-wrap;font-size:0.857rem;color:var(--muted)">${full}</pre></details>`:''}</div>`;
+}
+async function loadAgent(){
+  try{
+    const j=await api('/api/agent/status');
+    $('#agent-cards').innerHTML=`<div class="card"><div class="label">Queued</div><div class="val">${j.queued}</div></div>
+    <div class="card"><div class="label">Running</div><div class="val">${j.running}</div></div>
+    <div class="card"><div class="label">Done</div><div class="val">${j.done}</div></div>
+    <div class="card"><div class="label">Failed</div><div class="val">${j.failed}</div></div>`;
+    const rows=j.items.slice().reverse().map(jobHtml).join('');
+    $('#agent-list').innerHTML=rows||'<div class="empty">no jobs yet — describe a goal and run the hybrid agent</div>';
+    $('#agent-refresh').textContent='auto-refresh · '+(j.queued+j.running)+' active';
+    $('#agent-list').querySelectorAll('button[data-retry]').forEach(b=>b.addEventListener('click',async()=>{try{await post('/api/agent/retry',{id:b.dataset.retry});toast('Job requeued');loadAgent();}catch(e){toast(e.message,true);}}));
+  }catch(e){$('#agent-list').innerHTML='<div class="empty">failed to load queue</div>';}
+}
+ async function loadTask(){
+   try{
+     const t=await api('/api/task');
+     const el=$('#task-panel');
+     if(!t||!t.id){el.innerHTML='<div class="empty">no task state yet — run the hybrid agent</div>';$('#task-status').textContent='idle';return;}
+     const act=t.status==='running'||t.status==='created';
+     $('#task-status').textContent=act?'● running':'idle';
+     const hist=(t.history||[]).slice(-6).map(h=>`<span class="chip">${esc(h.phase||'')}</span>`).join(' ');
+     const PH={
+       'MEMORY_RECALL':['local','Memory recall'],
+       'API_PLAN':['super','Online AI supervisor: planning'],
+       'LOCAL_EXECUTION':['local','Local worker: implementing'],
+       'LOCAL_VERIFYING':['local','Local worker: verifying'],
+       'REVERIFYING':['local','Local worker: re-verifying'],
+       'SUPERVISOR_REVIEW':['super','Online AI supervisor: reviewing'],
+       'LOCAL_FIXING':['local','Local worker: applying fixes'],
+       'APPROVED':['ok','Approved'],
+       'REJECTED':['bad','Rejected'],
+       'CREATED':['local','Created'],
+     };
+     const pi=PH[t.phase]||['local',t.phase||'—'];
+     const pStyle=pi[0]==='super'?'color:var(--warn);background:rgba(245,184,75,.16)':pi[0]==='ok'?'color:var(--ok)':pi[0]==='bad'?'color:var(--bad)':'color:var(--accent2)';
+     el.innerHTML=`
+       <div class="row" style="flex-wrap:wrap;gap:8px;margin-bottom:10px">
+         <span class="chip" style="${pStyle}">${pi[0]==='super'?'🤖 ':''}${esc(pi[1])}</span>
+         <span class="chip" style="color:${t.status==='approved'?'var(--ok)':t.status==='rejected'?'var(--bad)':'var(--accent2)'}">status: ${esc(t.status||'')}</span>
+         <span class="chip">attempt ${esc(t.attempt||0)}</span>
+         <span class="chip">revision ${esc(t.revision||0)}</span>
+         ${t.decision?`<span class="chip" style="color:var(--warn)">decision: ${esc(t.decision)}</span>`:''}
+       </div>
+       <div class="d" style="margin-bottom:8px">${esc(t.goal||'')}</div>
+       <div class="sub" style="margin-bottom:8px">🔧 local worker implements &amp; verifies · 🤖 online AI acts ONLY as supervisor (plans &amp; reviews) — it never writes files or runs commands.</div>
+       <div class="sub">history: ${hist||'—'}</div>
+       ${t.evidence&&Object.keys(t.evidence).length?`<details><summary>evidence</summary><pre style="white-space:pre-wrap;font-size:0.857rem;color:var(--muted)">${esc(JSON.stringify(t.evidence,null,2))}</pre></details>`:''}`;
+   }catch(e){$('#task-panel').innerHTML='<div class="empty">failed to load task state</div>';$('#task-status').textContent='error';}
+ }
+async function clearDone(){
+  try{const j=await post('/api/agent/clear',{});toast('Cleared '+j.removed+' finished jobs');loadAgent();}catch(e){toast(e.message,true);}
+}
+function startAgentPoll(){
+  clearInterval(agentTimer);agentTimer=setInterval(()=>{loadAgent();loadTask();},2500);
+}
+$('#agent-run').addEventListener('click',()=>submitAgent(true));
+$('#agent-queue').addEventListener('click',()=>submitAgent(false));
+$('#agent-clear-done').addEventListener('click',clearDone);
+startAgentPoll();
+
+/* memory */
+async function loadMemStats(){
+  try{
+    const m=await api('/api/memory/stats');
+    const cats=Object.entries(m.by_category||{}).map(([k,v])=>`<span class="chip">${esc(k)}:${v}</span>`).join(' ');
+    $('#mem-cards').innerHTML=`<div class="card"><div class="label">Total memories</div><div class="val">${m.total}</div></div>
+    <div class="card"><div class="label">Avg importance</div><div class="val small">${m.average_importance}</div></div>
+    <div class="card"><div class="label">Max importance</div><div class="val small">${m.max_importance}</div></div>
+    <div class="card"><div class="label">Categories</div><div class="val small">${Object.keys(m.by_category||{}).length}</div><div class="sub">${cats}</div></div>`;
+  }catch(e){}
+}
+async function loadMem(q){
+  try{
+    const url=q?'/api/memory/search?q='+encodeURIComponent(q)+'&limit=50':'/api/memory/list';
+    const list=await api(url);
+    const rows=list.map(m=>`<div class="ev"><span class="k">${esc(m.category)}</span> <span class="t" title="${esc(m.created)}">${fmtTime(m.created)}</span><div class="d">${esc(m.text)}</div><div>${(m.tags||[]).map(t=>`<span class="chip">${esc(t)}</span>`).join('')} <span class="t">score ${m.score||''}</span><span style="float:right"><button class="btn ghost sm" data-forget="${esc(m.id)}">forget</button></span></div></div>`).join('');
+    $('#mem-list').innerHTML=rows||'<div class="empty">no memories</div>';
+    $('#mem-list').querySelectorAll('button[data-forget]').forEach(b=>b.addEventListener('click',async()=>{
+      if(!confirm('Forget this memory?'))return;
+      try{await post('/api/memory/forget',{id:b.dataset.forget});toast('Memory forgotten');loadMem(q||'');loadMemStats();}catch(e){toast(e.message,true);}
+    }));
+  }catch(e){$('#mem-list').innerHTML='<div class="empty">failed to load</div>';}
+}
+async function exportMem(){
+  try{
+    const list=await api('/api/memory/list');
+    const txt=JSON.stringify(list,null,2);
+    const blob=new Blob([txt],{type:'application/json'});
+    const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='openclaw-memories-'+new Date().toISOString().slice(0,10)+'.json';
+    document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(a.href);toast('Exported '+list.length+' memories');
+  }catch(e){toast(e.message,true);}
+}
+
+/* todos */
+let showDoneTodos=false;
+async function loadTodos(){
+  try{
+    const t=await api('/api/todos');
+    let items=(t.items||[]);
+    if(!showDoneTodos)items=items.filter(x=>!x.done);
+    const rows=items.map(x=>`<div class="ev"><div style="display:flex;gap:8px;align-items:center">
+      <input type="checkbox" ${x.done?'checked':''} data-id="${esc(x.id)}" onchange="toggleTodo(this)">
+      <span style="text-decoration:${x.done?'line-through':'none'};color:${x.done?'var(--muted)':'var(--txt)'}">${esc(x.text)}</span>
+      <span class="t" style="margin-left:auto">p${x.priority} · ${fmtTime(x.created)}</span>
+      <button class="btn ghost sm" data-tdel="${esc(x.id)}" title="Delete">✕</button></div></div>`).join('');
+    $('#todo-list').innerHTML=rows||'<div class="empty">no to-dos</div>';
+    $('#todo-list').querySelectorAll('button[data-tdel]').forEach(b=>b.addEventListener('click',async()=>{try{await post('/api/todo/del',{id:b.dataset.tdel});toast('To-do deleted');loadTodos();}catch(e){toast(e.message,true);}}));
+  }catch(e){$('#todo-list').innerHTML='<div class="empty">failed to load</div>';}
+}
+async function toggleTodo(cb){try{await post('/api/todo/done',{id:cb.dataset.id});await loadTodos()}catch(e){toast(e.message,true)}}
+async function exportTodos(){
+  try{const t=await api('/api/todos');const txt=JSON.stringify(t.items||[],null,2);const blob=new Blob([txt],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='openclaw-todos-'+new Date().toISOString().slice(0,10)+'.json';document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(a.href);toast('Exported to-dos');}catch(e){toast(e.message,true);}
+}
+
+/* tools */
+let _toolsList=[];let _toolsSort={key:'name',dir:1};
+async function loadTools(){
+  try{
+    const t=await api('/api/tools');
+    _toolsList=Object.entries(t).map(([name,meta])=>({name,description:meta.description||'',authority:meta.authority||''}));
+    renderTools();
+    const sel=$('#tool-run-name');if(sel){const prev=sel.value;sel.innerHTML=Object.keys(t).map(n=>`<option value="${esc(n)}">${esc(n)}</option>`).join('');if(prev)sel.value=prev;}
+  }catch(e){$('#tool-list').innerHTML='<tr><td colspan="3" class="empty">failed</td></tr>';}
+}
+function renderTools(){
+  const list=_toolsList.slice().sort((a,b)=>{const k=_toolsSort.key;const av=(a[k]||'').toLowerCase(),bv=(b[k]||'').toLowerCase();return av<bv?-1*_toolsSort.dir:av>bv?1*_toolsSort.dir:0;});
+  $('#tool-list').innerHTML=list.map(x=>`<tr><td><code>${esc(x.name)}</code></td><td>${esc(x.description)}</td><td>${esc(x.authority)}</td></tr>`).join('');
+  document.querySelectorAll('#tool-list-head th').forEach(th=>th.onclick=()=>{const k=th.dataset.sort;if(k){_toolsSort.dir=(_toolsSort.key===k)?-_toolsSort.dir:1;_toolsSort.key=k;renderTools();}});
+}
+
+async function runTool(){
+  const name=$('#tool-run-name').value;const argsRaw=$('#tool-run-args').value.trim();
+  $('#tool-run-status').textContent='running '+name+'…';$('#tool-run-out').textContent='';
+  let args={};if(argsRaw){try{args=JSON.parse(argsRaw);}catch(e){$('#tool-run-status').textContent='error: invalid JSON args';return;}}
+  try{
+    const j=await post('/api/tool',{name,args});
+    $('#tool-run-status').textContent=(j.ok?'ok':'error')+' — '+name;
+    $('#tool-run-out').textContent=JSON.stringify(j,null,2);
+    $('#tool-copy').style.display='inline-flex';
+  }catch(e){$('#tool-run-status').textContent='error: '+e.message;}
+}
+
+/* settings */
+async function loadSettings(){
+  try{
+    const s=await api('/api/settings');
+    $('#set-local-url').value=s.local_url||'';
+    $('#set-local-model').value=s.local_model||'';
+    $('#set-local-ctx').value=s.local_context_window||'32768';
+    $('#set-openai-model').value=s.openai_model||'';
+    $('#set-openai-base').value=s.openai_base_url||'';
+    $('#set-openai-set').textContent=s.openai_set?'· saved ✓':'· not set';
+    $('#set-openai-set').style.color=s.openai_set?'var(--ok)':'var(--warn)';
+    $('#set-anthropic-model').value=s.anthropic_model||'';
+    $('#set-anthropic-base').value=s.anthropic_base_url||'';
+    $('#set-anthropic-set').textContent=s.anthropic_set?'· saved ✓':'· not set';
+    $('#set-anthropic-set').style.color=s.anthropic_set?'var(--ok)':'var(--warn)';
+    $('#set-deepseek-model').value=s.deepseek_model||'';
+    $('#set-deepseek-base').value=s.deepseek_base_url||'';
+    $('#set-deepseek-set').textContent=s.deepseek_set?'· saved ✓':'· not set';
+    $('#set-deepseek-set').style.color=s.deepseek_set?'var(--ok)':'var(--warn)';
+    $('#set-local-key').placeholder=s.local_key_set?'saved (leave blank to keep)':'set if required';
+    $('#set-cards').innerHTML=`<div class="card"><div class="label">Worker model</div><div class="val small">${esc(s.worker_model||'none')}</div><div class="sub">currently used for local work</div></div>
+    <div class="card"><div class="label">Online providers</div><div class="val">${[s.openai_set,s.anthropic_set,s.deepseek_set].filter(Boolean).length}/3</div><div class="sub">OpenAI · Anthropic · DeepSeek</div></div>
+    <div class="card"><div class="label">Local endpoint</div><div class="val small" style="font-size:0.929rem">${esc(s.local_url||'not set')}</div></div>`;
+    $('#set-models').innerHTML=(s.models||[]).map(m=>`<tr><td><code>${esc(m.name)}</code></td><td>${esc(m.provider)}</td><td>${esc(m.role)}</td></tr>`).join('')||'<tr><td colspan="3" class="empty">no models configured</td></tr>';
+    const presets=s.presets||[];const box=$('#set-presets');if(!box)return;
+    const sec=(name)=>`<div class="sub-hd" style="margin-top:14px;font-weight:700;color:var(--accent)">${esc(name[0].toUpperCase()+name.slice(1))}</div>`;
+    let html=presets.length?'':'<div class="empty">no preset settings</div>';
+    let last='';
+    presets.forEach(p=>{
+      if(p.section!==last){html+=sec(p.section||'general');last=p.section;}
+      const id='set-preset-'+p.key;const hint=p.hint?`<div class="sub" style="color:var(--muted)">${esc(p.hint)}</div>`:'';
+      const label=`<label for="${id}">${esc(p.label)}</label>`;
+      let field;
+      if(p.type==='select'){field=`<select id="${id}" class="preset">${(p.options||[]).map(o=>`<option value="${esc(o)}" ${String(p.value)===o?'selected':''}>${esc(o)}</option>`).join('')}</select>`;}
+      else if(p.type==='textarea'){field=`<textarea id="${id}" class="preset" rows="2" style="width:100%;resize:vertical">${esc(p.value||'')}</textarea>`;}
+      else{field=`<input type="text" id="${id}" class="preset" value="${esc(p.value||'')}">`;}
+      html+=`<div class="field" style="position:relative"><label for="${id}">${esc(p.label)}</label>${field}<div style="position:absolute;top:2px;right:2px"><button type="button" class="btn ghost sm" data-reset="${esc(p.key)}" data-val="${esc(p.default||'')}" title="Reset to default">↺</button></div>${hint}</div>`;
+    });
+    box.innerHTML=html;
+    box.querySelectorAll('[data-reset]').forEach(b=>b.addEventListener('click',()=>{
+      const el=document.getElementById('set-preset-'+b.dataset.reset);
+      if(el){el.value=b.dataset.val;toast('Reset '+b.dataset.reset+' to default');}
+    }));
+  }catch(e){$('#set-status').textContent='failed to load settings: '+e.message;}
+}
+async function saveSettings(){
+  const payload={
+    LOCAL_URL:$('#set-local-url').value.trim(),
+    LOCAL_MODEL:$('#set-local-model').value.trim(),
+    LOCAL_CONTEXT_WINDOW:$('#set-local-ctx').value.trim(),
+    LOCAL_KEY:$('#set-local-key').value.trim(),
+    OPENAI_API_KEY:$('#set-openai-key').value.trim(),
+    OPENAI_MODEL:$('#set-openai-model').value.trim(),
+    OPENAI_BASE_URL:$('#set-openai-base').value.trim(),
+    ANTHROPIC_API_KEY:$('#set-anthropic-key').value.trim(),
+    ANTHROPIC_MODEL:$('#set-anthropic-model').value.trim(),
+    ANTHROPIC_BASE_URL:$('#set-anthropic-base').value.trim(),
+    DEEPSEEK_API_KEY:$('#set-deepseek-key').value.trim(),
+    DEEPSEEK_MODEL:$('#set-deepseek-model').value.trim(),
+    DEEPSEEK_BASE_URL:$('#set-deepseek-base').value.trim(),
+  };
+  document.querySelectorAll('#set-presets .preset').forEach(el=>payload[el.id.replace('set-preset-','')]=el.value);
+  $('#set-save').disabled=true;$('#set-status').textContent='saving…';
+  try{
+    const j=await post('/api/settings',payload);
+    $('#set-status').textContent='saved · changed: '+(j.changed.length?j.changed.join(', '):'none');
+    $('#set-local-key').value='';$('#set-openai-key').value='';$('#set-anthropic-key').value='';$('#set-deepseek-key').value='';
+    toast('Settings saved & models reloaded');loadSettings();loadModels('#chat-model');loadModels('#agent-model');
+  }catch(e){$('#set-status').textContent='error: '+e.message;toast(e.message,true);}
+  finally{$('#set-save').disabled=false;}
+}
+
+/* preset settings modal */
+function openPresets(){loadSettings();$('#preset-modal').classList.add('open');}
+function closePresets(){$('#preset-modal').classList.remove('open');}
+$('#set-presets-trigger').addEventListener('dblclick',openPresets);
+$('#preset-close').addEventListener('click',closePresets);
+$('#preset-backdrop').addEventListener('click',closePresets);
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closePresets();});
+$('#preset-save').addEventListener('click',async()=>{
+  $('#preset-status').textContent='saving…';
+  try{
+    const payload={};
+    document.querySelectorAll('#set-presets .preset').forEach(el=>payload[el.id.replace('set-preset-','')]=el.value);
+    const j=await post('/api/settings',payload);
+    $('#preset-status').textContent='saved · changed: '+(j.changed.length?j.changed.join(', '):'none');
+    toast('Settings saved & models reloaded');
+    $('#set-status').textContent='saved';loadSettings();loadModels('#chat-model');loadModels('#agent-model');
+  }catch(e){$('#preset-status').textContent='error: '+e.message;toast(e.message,true);}
+});
+
+/* system */
+async function loadSystem(){
+  try{
+    const s=await api('/api/system');
+    const i=s.system||{};
+    $('#sys-cards').innerHTML=`<div class="card"><div class="label">Platform</div><div class="val small">${esc(i.platform||'—')}</div></div>
+    <div class="card"><div class="label">Python</div><div class="val small">${esc(i.python||'—')}</div></div>
+    <div class="card"><div class="label">OpenClaw home</div><div class="val small" style="font-size:0.929rem">${esc(i.openclaw_home||'—')}</div></div>
+    <div class="card"><div class="label">Terminal policy</div><div class="val small">${esc(s.config.terminal_policy||'—')}</div></div>`;
+    $('#sys-env').textContent=JSON.stringify(s,null,2);
+    $('#badge-time').textContent=i.time||'';
+    loadErrors();
+  }catch(e){$('#sys-env').textContent='failed: '+e.message}
+}
+
+/* terminal */
+async function loadTerminal(){
+  try{
+    const s=await api('/api/system');
+    $('#term-status').textContent='policy: '+(s.config.terminal_policy||'worker');
+  }catch(e){$('#term-status').textContent='status unavailable';}
+}
+function termWrite(html){const o=$('#term-out');o.insertAdjacentHTML('beforeend',html);o.scrollTop=o.scrollHeight;}
+function termLine(txt,cls){return `<div class="term-line ${cls||''}">${esc(txt)}</div>`;}
+async function runTerminal(){
+  const input=$('#term-input');const cmd=input.value.trim();if(!cmd)return;
+  $('#term-run').disabled=true;
+  termWrite(termLine('$ '+cmd,'cmd'));
+  input.value='';
+  try{
+    const cwdTxt=$('#term-cwd').textContent;const dir=cwdTxt.indexOf('~/')===0?cwdTxt.slice(2):cwdTxt;
+    const j=await post('/api/terminal',{command:cmd,cwd:dir});
+    if(j.stderr)termWrite(termLine(j.stderr,'err'));
+    if(j.stdout)termWrite(termLine(j.stdout,'out'));
+    if(!j.stdout&&!j.stderr)termWrite(termLine('(no output)','muted'));
+    if(j.error)termWrite(termLine('blocked: '+j.error,'err'));
+    $('#term-cwd').textContent=j.cwd||'~/';
+  }catch(e){termWrite(termLine('error: '+e.message,'err'));}
+  finally{$('#term-run').disabled=false;input.focus();}
+}
+$('#term-run').addEventListener('click',runTerminal);
+$('#term-input').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();runTerminal();}});
+$('#term-clear').addEventListener('click',()=>{$('#term-out').innerHTML='';$('#term-input').focus();});
+$('#err-clear').addEventListener('click',clearErrors);
+
+/* heartbeat + wiring */
+async function heartbeat(){
+  try{const s=await api('/api/system');$('#hd-status').textContent='online · '+s.system.python;$('#hd-dot').className='dot ok';}
+  catch(e){$('#hd-status').textContent='offline';$('#hd-dot').className='dot bad';}
+}
+$('#chat-send').addEventListener('click',sendChat);
+$('#toast').addEventListener('click',e=>{if(e.target.classList.contains('t-x'))$('#toast').className='toast';});
+$('#chat-input').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendChat()}});
+$('#mem-add').addEventListener('click',async()=>{
+  const text=$('#mem-text').value.trim();if(!text){toast('Enter memory text',true);return;}
+  try{
+    const tags=$('#mem-tags').value.split(',').map(s=>s.trim()).filter(Boolean);
+    await post('/api/memory/add',{text,category:$('#mem-cat').value||'general',tags,importance:parseFloat($('#mem-imp').value)||0.7});
+    $('#mem-text').value='';toast('Memory stored');loadMemStats();loadMem('');
+  }catch(e){toast(e.message,true)}
+});
+$('#mem-search-input').addEventListener('input',e=>{const v=e.target.value.trim();clearTimeout(window._mt);window._mt=setTimeout(()=>loadMem(v),300)});
+$('#mem-upload').addEventListener('click',async()=>{
+  const files=$('#mem-files').files;if(!files.length){toast('Choose a file first',true);return;}
+  const cat=$('#mem-cat').value||'document';
+  const btn=$('#mem-upload');const st=$('#mem-upload-status');
+  btn.disabled=true;let ok=0;
+  for(const f of Array.from(files)){
+    st.textContent='Uploading '+f.name+'…';
+    try{
+      const b64=await new Promise((res,rej)=>{const rd=new FileReader();rd.onload=()=>res(rd.result);rd.onerror=()=>rej(new Error('read failed'));rd.readAsDataURL(f);});
+      const j=await post('/api/memory/documents',{filename:f.name,content:b64,category:cat});
+      ok++;st.textContent='Stored '+j.filename+(j.text_preview?' — '+j.text_preview:'');
+    }catch(e){st.textContent=f.name+': '+e.message;toast(f.name+': '+e.message,true);}
+  }
+  btn.disabled=false;$('#mem-files').value='';
+  if(ok){toast('Stored '+ok+' document'+(ok>1?'s':'')+' into memory');loadMemStats();loadMem('');}
+});
+$('#ov-filter').addEventListener('input',renderOverviewEvents);
+$('#todo-add').addEventListener('click',async()=>{
+  const text=$('#todo-text').value.trim();if(!text){toast('Enter to-do text',true);return;}
+  try{await post('/api/todo/add',{text,priority:parseInt($('#todo-pri').value)||0});$('#todo-text').value='';loadTodos();}catch(e){toast(e.message,true)}
+});
+$('#set-save').addEventListener('click',saveSettings);
+$('#mem-export').addEventListener('click',exportMem);
+$('#todo-export').addEventListener('click',exportTodos);
+$('#todo-showdone').addEventListener('change',e=>{showDoneTodos=e.target.checked;loadTodos();});
+$('#tool-run').addEventListener('click',runTool);
+$('#tool-copy').addEventListener('click',()=>copyText($('#tool-run-out').textContent));
+$('#sys-backup').addEventListener('click',async()=>{
+  const st=$('#sys-backup-status');st.textContent='creating backup…';
+  try{const j=await post('/api/backup',{});st.textContent='backup ok · '+j.path+' · '+Math.round(j.bytes/1024)+' KB';toast('Backup created');}catch(e){st.textContent='backup failed: '+e.message;toast(e.message,true);}
+});
+
+/* init */
+(async function init(){
+  initTheme();
+  initFontSize();
+  const _wt=$('#welcome-ts');if(_wt)_wt.textContent=chatTs();
+  wireCollapse();
+  loadOverview();loadModels('#chat-model');loadModels('#agent-model');loadMemStats();loadMem('');loadTodos();
+  heartbeat();setInterval(heartbeat,5000);
+  setInterval(()=>{if(cur==='overview')loadOverview()},10000);
+  loadAgent();setInterval(()=>{if(cur==='agent')loadAgent()},3000);
+})();
+</script>
+</body></html>'''
 
 class DashboardHandler(BaseHTTPRequestHandler):
+    def _send(self, code, body, ctype="application/json"):
+        if isinstance(body,str): body=body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type",ctype)
+        self.send_header("Content-Length",str(len(body)))
+        self.send_header("Cache-Control","no-store")
+        self.end_headers()
+        self.wfile.write(body)
+    def _qs(self):
+        return urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+    def _qint(self, key, default):
+        try: return int(self._qs().get(key,[default])[0])
+        except Exception: return default
     def do_GET(self):
-        if self.path=="/events": body=json.dumps(read_events()).encode(); c="application/json"
-        else: body=DASHBOARD_HTML.encode(); c="text/html; charset=utf-8"
-        self.send_response(200); self.send_header("Content-Type",c); self.send_header("Content-Length",str(len(body))); self.end_headers(); self.wfile.write(body)
+        path=urllib.parse.urlparse(self.path).path
+        try:
+            if path=="/events":
+                self._send(200,json.dumps(read_events()))
+            elif path=="/api/events":
+                self._send(200,json.dumps({"events":read_events(self._qint("limit",200))}))
+            elif path=="/api/health":
+                self._send(200,json.dumps(health_report()))
+            elif path=="/api/memory/stats":
+                self._send(200,json.dumps(mem_stats()))
+            elif path=="/api/memory/list":
+                self._send(200,json.dumps(mem_search("",200)))
+            elif path=="/api/memory/search":
+                self._send(200,json.dumps(mem_search(self._qs().get("q",[""])[0],self._qint("limit",20))))
+            elif path=="/api/task":
+                self._send(200,json.dumps(json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else None))
+            elif path=="/api/agent/status":
+                self._send(200,json.dumps(agent_inbox_list()))
+            elif path=="/api/errors":
+                self._send(200,json.dumps({"errors":read_errors(self._qint("limit",100))}))
+            elif path=="/api/system/resources":
+                self._send(200,json.dumps(system_resources()))
+            elif path=="/api/models":
+                self._send(200,json.dumps([{"name":m["name"],"provider":m.get("provider"),"role":m.get("role"),"url":m.get("url",""),"context_window":int(m.get("context_window",32768)),"vision":m.get("vision",False),"tool_calls":m.get("tool_calls",False)} for m in MODELS]))
+            elif path=="/api/tools":
+                self._send(200,json.dumps(TOOL_REGISTRY))
+            elif path=="/api/todos":
+                self._send(200,json.dumps(todo_list(include_done=True)))
+            elif path=="/api/settings":
+                self._send(200,json.dumps(settings_status()))
+            elif path=="/api/system":
+                self._send(200,json.dumps({"system":safe_local_tool("system_info"),"config":{"openclaw_home":str(ROOT),"worker_model":worker_model_name(),"supervisor_model":SUPERVISOR_MODEL_NAME,"terminal_policy":os.getenv("LOCAL_TERMINAL_POLICY","worker"),"models":[{"name":m["name"],"provider":m.get("provider"),"role":m.get("role"),"vision":m.get("vision",False),"tool_calls":m.get("tool_calls",False),"context_window":int(m.get("context_window",32768))} for m in MODELS]}}))
+            elif path=="/favicon.ico":
+                self._send(404,"")
+            else:
+                self._send(200,FRONTEND_HTML,"text/html; charset=utf-8")
+        except Exception as e:
+            log_error("get:"+path,e)
+            try: self._send(500,json.dumps({"ok":False,"error":str(e)}))
+            except Exception: pass
+    def do_POST(self):
+        path=urllib.parse.urlparse(self.path).path
+        try:
+            length=int(self.headers.get("Content-Length",0) or 0)
+            raw=self.rfile.read(length).decode("utf-8") if length else "{}"
+            body=json.loads(raw) if raw else {}
+        except Exception:
+            self._send(400,json.dumps({"ok":False,"error":"invalid JSON body"})); return
+        try:
+            if path=="/api/chat":
+                prompt=body.get("prompt","")
+                conv=body.get("conversation","web") or "web"
+                model=body.get("model")
+                mode=str(body.get("mode","auto")).lower()
+                history=body.get("history") if isinstance(body.get("history"),list) else None
+                sources=[]
+                # Detect web intent in this prompt OR a continuation of a prior
+                # web query (e.g. "has todo tu" after "buscame vuelos...").
+                wi=web_intent(prompt)
+                if not wi and isinstance(history,list):
+                    for h in history[-12:]:
+                        if web_intent(str(h.get("content",""))):
+                            wi=True; break
+                if wi:
+                    aug=""
+                    try:
+                        res=research(prompt,limit=3,fetch=True)
+                        if res.get("results"):
+                            items=[]
+                            for x in res["results"]:
+                                items.append({"title":x.get("title",""),"url":x.get("url",""),"snippet":(x.get("snippet","") or "")[:300],"content":(x.get("page_text") or "")[:2500]})
+                            sources=[{"title":x.get("title","") or x.get("url",""),"url":x.get("url","")} for x in res["results"] if x.get("url")]
+                            aug=prompt+"\n\nLive web content scraped from the top results. Answer in plain text using this content (cite source URLs); do NOT output code or a plan.\n"+json.dumps(items,ensure_ascii=False)
+                            log_event("chat_web_augmented",results=len(res["results"]))
+                        else:
+                            aug=prompt+"\n\n(Web search returned no live results. Say briefly that live data could not be retrieved.)"
+                    except Exception as e:
+                        log_error("chat_web_augment",e); aug=prompt
+                    result=chat(aug,conv,body.get("system") or "You are a concise research assistant. Answer in plain text from the provided web content only; never output code or a plan.",False,False,model,None,True,history)
+                    answer=result.get("choices",[{}])[0].get("message",{}).get("content","")
+                elif mode=="chat":
+                    result=chat(prompt,conv,body.get("system"),False,False,model,None,True,history)
+                    answer=result.get("choices",[{}])[0].get("message",{}).get("content","")
+                elif not model or model==worker_model_name():
+                    try:
+                        result=general_agent(prompt,conv,None,int(body.get("steps",4)))
+                        answer=result.get("answer","")
+                    except Exception as e:
+                        log_error("chat_hybrid_fallback",e)
+                        result=chat(prompt,conv,body.get("system"),False,False,None,None,True,history)
+                        answer=result.get("choices",[{}])[0].get("message",{}).get("content","")
+                else:
+                    result=chat(prompt,conv,body.get("system"),False,False,model,None,True,history)
+                    answer=result.get("choices",[{}])[0].get("message",{}).get("content","")
+                self._send(200,json.dumps({"ok":True,"answer":answer,"sources":sources,
+                    "model":result.get("_model") if isinstance(result,dict) else None,
+                    "provider":result.get("_provider") if isinstance(result,dict) else None,
+                    "role":result.get("_role") if isinstance(result,dict) else None}))
+            elif path=="/api/agent":
+                result=general_agent(body.get("goal",""),body.get("conversation","agent"),body.get("model"),int(body.get("steps",4)))
+                self._send(200,json.dumps({"ok":True,"answer":result.get("answer",""),"task_id":result.get("task",{}).get("id"),"decision":result.get("task",{}).get("decision"),"status":result.get("task",{}).get("status")}))
+            elif path=="/api/agent/queue":
+                item=agent_inbox_add(body.get("goal",""),body.get("conversation","agent"),int(body.get("steps",4)))
+                self._send(200,json.dumps({"ok":True,"queued":item["id"],"status":"queued"}))
+            elif path=="/api/agent/clear":
+                items=_load_inbox(); keep=[x for x in items if x.get("status") in ("queued","running")]; _save_inbox(keep)
+                log_event("agent_cleared",removed=len(items)-len(keep))
+                self._send(200,json.dumps({"ok":True,"removed":len(items)-len(keep),"status":agent_inbox_list()}))
+            elif path=="/api/memory/add":
+                mid=mem_add(body.get("text",""),body.get("category","general"),body.get("tags",[]),float(body.get("importance",0.7)))
+                self._send(200,json.dumps({"ok":True,"id":mid}))
+            elif path=="/api/memory/forget":
+                self._send(200,json.dumps({"ok":True,"deleted":mem_forget(body.get("id",""))}))
+            elif path=="/api/memory/documents":
+                try:
+                    filename=os.path.basename(str(body.get("filename","document.txt")).replace("\\","/")) or "upload.txt"
+                    content=str(body.get("content",""))
+                    category=str(body.get("category","document"))
+                    if not content:
+                        self._send(400,json.dumps({"ok":False,"error":"no file content"})); return
+                    if content.startswith("data:") and "," in content:
+                        content=content.split(",",1)[1]
+                    if len(content)>int(os.getenv("OPENCLAW_UPLOAD_MAX_B64",str(35_000_000))):
+                        self._send(400,json.dumps({"ok":False,"error":"file too large"})); return
+                    data=base64.b64decode(content)
+                    up=ROOT/"uploads"; up.mkdir(parents=True,exist_ok=True)
+                    path=up/("_".join(filename.split()))
+                    n=1
+                    while path.exists():
+                        path=up/("%d_%s"%(n,filename)); n+=1
+                    path.write_bytes(data)
+                    res=ingest_file(str(path),category)
+                    self._send(200,json.dumps({"ok":True,"memory_id":res.get("memory_id"),"filename":filename,"category":category,"text_preview":str(res.get("text",""))[:600]}))
+                except Exception as e:
+                    log_error("api:memory/documents",e)
+                    self._send(400,json.dumps({"ok":False,"error":str(e)}))
+            elif path=="/api/settings":
+                self._send(200,json.dumps(apply_settings(body)))
+            elif path=="/api/tool":
+                self._send(200,json.dumps(dispatch_tool(body.get("name",""),body.get("args",{}))))
+            elif path=="/api/todo/add":
+                self._send(200,json.dumps(todo_add(body.get("text",""),int(body.get("priority",0)))))
+            elif path=="/api/todo/done":
+                self._send(200,json.dumps(todo_done(body.get("id",""))))
+            elif path=="/api/todo/del":
+                self._send(200,json.dumps(todo_del(body.get("id",""))))
+            elif path=="/api/agent/retry":
+                self._send(200,json.dumps(agent_inbox_retry(body.get("id",""))))
+            elif path=="/api/backup":
+                self._send(200,json.dumps(make_backup()))
+            elif path=="/api/terminal":
+                self._send(200,json.dumps(web_terminal(body.get("command",""),body.get("cwd",""))))
+            elif path=="/api/errors":
+                self._send(200,json.dumps({"ok":True,"cleared":clear_errors()}))
+            else:
+                self._send(404,json.dumps({"ok":False,"error":"not found"}))
+        except Exception as e:
+            log_error("api:"+path,e)
+            self._send(500,json.dumps({"ok":False,"error":str(e)}))
     def log_message(self,*args): pass
 
 def dashboard(port=8765):
@@ -1085,48 +2449,186 @@ class TextExtractor(HTMLParser):
             text=" ".join(data.split())
             if text: self.parts.append(text)
 
-def browser_search(query, limit=5):
-    log_event("search_started",query=query,limit=limit)
-    """Search the public web through DuckDuckGo's HTML endpoint.
+_SEARCH_STOPWORDS={"the","and","for","are","was","were","with","from","this","that","what","who","when","where","how","why","which","there","here","about","into","over","after","before","during","while","have","has","had","you","your","their","them","they","its","not","but","also","only","just","been","being","does","did","doing","will","would","should","could","can","any","all","one","get","got","much","many","very","than","then","per"}
+# Generic time/qualifier words are weak discriminators; a result matching only
+# these is not evidence of a relevant hit (e.g. "recent" for a Varna query).
+_SEARCH_WEAK_TERMS={"recent","today","latest","news","now","best","top","great","good","free","online","info","new","list","search","guide","report","update","updates","events","event","city","things","thing","day","days","week","year","years","info","people","local","2024","2025","2026","us","uk"}
 
-    Returns source-aware records. Search pages are treated as untrusted data;
-    their text is never executed as instructions.
-    """
-    url="https://html.duckduckgo.com/html/?q="+urllib.parse.quote_plus(query)
-    req=urllib.request.Request(url,headers={"User-Agent":"OpenClaw/1.0 research bot"})
-    try:
-        with urllib.request.urlopen(req,timeout=20) as r: body=r.read().decode("utf-8",errors="ignore")
-    except Exception as e: raise RuntimeError("web search failed: "+str(e))
-    results=[]
-    for block in re.findall(r'<div class="result__body".*?</div>\s*</div>',body,re.S|re.I):
-        link=re.search(r'class="result__a"[^>]*href="([^"]+)',block,re.I)
-        title=re.search(r'class="result__a"[^>]*>(.*?)</a>',block,re.S|re.I)
-        snippet=re.search(r'class="result__snippet"[^>]*>(.*?)</',block,re.S|re.I)
-        if not link: continue
-        href=html.unescape(link.group(1))
-        if "uddg=" in href:
-            href=urllib.parse.parse_qs(urllib.parse.urlparse(href).query).get("uddg",[href])[0]
-        clean=lambda x: re.sub(r"<[^>]+>"," ",html.unescape(x or "")).strip()
-        results.append({"title":clean(title.group(1) if title else ""),"url":href,"snippet":clean(snippet.group(1) if snippet else "")})
-        if len(results)>=limit: break
-    # DuckDuckGo can occasionally show a bot challenge. Use Bing HTML as a
-    # fallback instead of returning an empty result set.
-    if not results:
+def _search_terms(query):
+    toks=re.findall(r"[a-z0-9]{3,}", (query or "").lower())
+    return [t for t in toks if t not in _SEARCH_STOPWORDS]
+
+def _strong_terms(terms):
+    return [t for t in terms if t not in _SEARCH_WEAK_TERMS]
+
+def _result_terms_hit(terms, title, snippet, url):
+    title_l=(title or "").lower(); url_l=(url or "").lower(); body_l=(snippet or "").lower()
+    return {t for t in terms if t in title_l or t in url_l or t in body_l}
+
+def _is_specific(terms, title, snippet, url):
+    """True when a result matches something specific, not just one filler word."""
+    if not terms: return True
+    hit=_result_terms_hit(terms,title,snippet,url)
+    if len(hit)>=2: return True
+    if hit and hit.issubset(_SEARCH_WEAK_TERMS): return False
+    return bool(hit)
+
+def _result_score(terms, title, snippet, url):
+    if not terms: return 0.0
+    title_l=(title or "").lower(); url_l=(url or "").lower(); body_l=(snippet or "").lower()
+    score=0.0
+    for t in terms:
+        if t in title_l: score+=2.0
+        elif t in url_l: score+=1.5
+        if t in body_l: score+=0.5
+    return score
+
+def _dedupe_results(results):
+    seen=set(); out=[]
+    for r in results:
+        if r.get("url") and r["url"] not in seen:
+            seen.add(r["url"]); out.append(r)
+    return out
+
+def _clean_html(s):
+    return re.sub(r"<[^>]+>"," ",html.unescape(s or "")).strip()
+
+def _normalize_search_url(href, base_url):
+    href=html.unescape(href or "").strip()
+    if not href or href.startswith(("#","javascript:","mailto:","tel:")): return None
+    if "uddg=" in href:
         try:
-            bq="https://www.bing.com/search?q="+urllib.parse.quote_plus(query)
-            breq=urllib.request.Request(bq,headers={"User-Agent":"Mozilla/5.0"})
-            with urllib.request.urlopen(breq,timeout=20) as r: bbody=r.read().decode("utf-8",errors="ignore")
-            for block in re.findall(r'<li class="b_algo".*?</li>',bbody,re.S|re.I):
-                link=re.search(r'<h2[^>]*>\\s*<a[^>]*href="([^"]+)',block,re.S|re.I)
-                title=re.search(r'<h2[^>]*>\\s*<a[^>]*>(.*?)</a>',block,re.S|re.I)
-                snippet=re.search(r'<p[^>]*>(.*?)</p>',block,re.S|re.I)
-                if link:
-                    clean=lambda x: re.sub(r"<[^>]+>"," ",html.unescape(x or "")).strip()
-                    results.append({"title":clean(title.group(1) if title else ""),"url":html.unescape(link.group(1)),"snippet":clean(snippet.group(1) if snippet else "")})
-                    if len(results)>=limit: break
-        except Exception as e: log_event("search_fallback_failed",error=str(e))
-    log_event("search_completed",query=query,results=len(results))
-    return results
+            dec=urllib.parse.parse_qs(urllib.parse.urlparse(href).query).get("uddg",[href])[0]
+            if dec.startswith("http"): return dec
+        except Exception: pass
+    if href.startswith("//"): href="https:"+href
+    if not href.startswith("http"): href=urllib.parse.urljoin(base_url,href)
+    return href
+
+def _html_search(engine, query, limit):
+    """Scrape one keyless HTML search engine. Results are untrusted data only."""
+    q=urllib.parse.quote_plus(query)
+    if engine=="duckduckgo":
+        url="https://html.duckduckgo.com/html/?q="+q
+        ua="OpenClaw/1.0 research bot"
+        pattern=r'<div class="result__body".*?</div>\s*</div>'
+    elif engine=="duckduckgo_lite":
+        url="https://lite.duckduckgo.com/lite/?q="+q
+        ua="Mozilla/5.0"
+        pattern=r'<table class="result".*?</table>'
+    elif engine=="bing":
+        url="https://www.bing.com/search?q="+q
+        ua="Mozilla/5.0"
+        pattern=r'<li class="b_algo".*?</li>'
+    else:
+        raise ValueError("unknown search engine: "+engine)
+    req=urllib.request.Request(url,headers={"User-Agent":ua})
+    with urllib.request.urlopen(req,timeout=20) as r: body=r.read().decode("utf-8",errors="ignore")
+    out=[]
+    for block in re.findall(pattern,body,re.S|re.I):
+        if engine in ("duckduckgo","duckduckgo_lite"):
+            link=re.search(r'class="result__a"[^>]*href="([^"]+)',block,re.I)
+            if not link:
+                link=re.search(r'class="result-link"[^>]*href="([^"]+)',block,re.I)
+            title=re.search(r'class="result__a"[^>]*>(.*?)</a>',block,re.S|re.I)
+            if not title:
+                title=re.search(r'class="result-link"[^>]*>(.*?)</a>',block,re.S|re.I)
+            snippet=re.search(r'class="result__snippet"[^>]*>(.*?)</',block,re.S|re.I)
+            if not snippet:
+                snippet=re.search(r'class="result-snippet">(.*?)</td>',block,re.S|re.I)
+        else:
+            link=re.search(r'<h2[^>]*>\s*<a[^>]*href="([^"]+)',block,re.S|re.I)
+            title=re.search(r'<h2[^>]*>\s*<a[^>]*>(.*?)</a>',block,re.S|re.I)
+            snippet=re.search(r'<p[^>]*>(.*?)</p>',block,re.S|re.I)
+        if not link: continue
+        href=_normalize_search_url(link.group(1),url)
+        if not href: continue
+        u=urllib.parse.parse_qs(urllib.parse.urlparse(href).query).get("u",[None])[0]
+        if u and u.startswith("a1"):
+            try:
+                pad="="*((-len(u[2:]))%4)
+                dec=base64.urlsafe_b64decode(u[2:]+pad).decode("utf-8","ignore")
+                if dec.startswith("http"): href=dec
+            except Exception: pass
+        out.append({"title":_clean_html(title.group(1) if title else ""),"url":href,"snippet":_clean_html(snippet.group(1) if snippet else "")})
+        if len(out)>=limit: break
+    return out
+
+def _api_search(api, query, limit):
+    """Quality search via an optional API backend (Brave/Serper/Tavily/Bing)."""
+    api=api.lower()
+    key_map={"brave":os.getenv("BRAVE_SEARCH_API_KEY",os.getenv("SEARCH_API_KEY","")),
+             "serper":os.getenv("SERPER_API_KEY",os.getenv("SEARCH_API_KEY","")),
+             "tavily":os.getenv("TAVILY_API_KEY",os.getenv("SEARCH_API_KEY","")),
+             "bing":os.getenv("BING_SEARCH_API_KEY",os.getenv("SEARCH_API_KEY",""))}
+    key=key_map.get(api,"")
+    if not key: raise RuntimeError("no API key configured for "+api)
+    out=[]
+    if api=="brave":
+        req=urllib.request.Request("https://api.search.brave.com/res/v1/web/search?q="+urllib.parse.quote_plus(query)+"&count="+str(limit),headers={"Accept":"application/json","X-Subscription-Token":key})
+        with urllib.request.urlopen(req,timeout=25) as r: data=json.loads(r.read().decode())
+        for it in data.get("web",{}).get("results",[]):
+            out.append({"title":it.get("title",""),"url":it.get("url",""),"snippet":it.get("description",it.get("page_age",""))})
+    elif api=="serper":
+        body=json.dumps({"q":query,"num":limit}).encode()
+        req=urllib.request.Request("https://google.serper.dev/search",body,{"Content-Type":"application/json","X-API-KEY":key})
+        with urllib.request.urlopen(req,timeout=25) as r: data=json.loads(r.read().decode())
+        for it in data.get("organic",[]):
+            out.append({"title":it.get("title",""),"url":it.get("link",""),"snippet":it.get("snippet","")})
+    elif api=="tavily":
+        body=json.dumps({"query":query,"max_results":limit,"search_depth":"basic"}).encode()
+        req=urllib.request.Request("https://api.tavily.com/search",body,{"Content-Type":"application/json","Authorization":"Bearer "+key})
+        with urllib.request.urlopen(req,timeout=25) as r: data=json.loads(r.read().decode())
+        for it in data.get("results",[]):
+            out.append({"title":it.get("title",""),"url":it.get("url",""),"snippet":it.get("content","")})
+    elif api=="bing":
+        req=urllib.request.Request("https://api.bing.microsoft.com/v7.0/search?q="+urllib.parse.quote_plus(query),headers={"Ocp-Apim-Subscription-Key":key})
+        with urllib.request.urlopen(req,timeout=25) as r: data=json.loads(r.read().decode())
+        for it in data.get("webPages",{}).get("value",[]):
+            out.append({"title":it.get("name",""),"url":it.get("url",""),"snippet":it.get("snippet","")})
+    return _dedupe_results(out)[:limit]
+
+def browser_search(query, limit=5):
+    """Search the live web with relevance ranking and multi-engine fallback.
+
+    Search pages are treated as untrusted data; their text is never executed
+    as instructions. Quality APIs (Brave/Serper/Tavily/Bing) are used when
+    OPENCLAW_SEARCH_API + a key are configured; otherwise keyless HTML engines
+    are tried in order and the results are re-ranked by query relevance.
+    """
+    log_event("search_started",query=query,limit=limit)
+    terms=_search_terms(query)
+    results=[]
+    api=os.getenv("OPENCLAW_SEARCH_API","").strip().lower()
+    if api:
+        try: results.extend(_api_search(api,query,max(limit,8)))
+        except Exception as e: log_event("search_api_failed",engine=api,error=str(e))
+    if not results:
+        for engine in ("duckduckgo","duckduckgo_lite","bing"):
+            try:
+                results.extend(_html_search(engine,query,limit))
+            except Exception as e:
+                log_event("search_engine_failed",engine=engine,error=str(e))
+            if _dedupe_results(results) and len(_dedupe_results(results))>=limit: break
+    results=_dedupe_results(results)
+    # If no result is specific to the query, retry using only the strong terms.
+    # This stops engines from latching onto a single filler word (e.g. "recent")
+    # or being defeated by blocked backends returning an empty set.
+    def _any_specific(rs):
+        return any(_is_specific(terms,r.get("title",""),r.get("snippet",""),r.get("url","")) for r in rs) if terms else True
+    if terms and not _any_specific(results):
+        strong=_strong_terms(terms) or terms
+        alt=" ".join(strong)
+        for engine in ("duckduckgo","duckduckgo_lite","bing"):
+            if alt!=query:
+                try: results=_dedupe_results(results+_html_search(engine,alt,limit))
+                except Exception: pass
+            if _any_specific(results): break
+    if terms:
+        results.sort(key=lambda r:-_result_score(terms,r.get("title",""),r.get("snippet",""),r.get("url","")))
+    ranked=results[:limit]
+    log_event("search_completed",query=query,results=len(ranked))
+    return ranked
 
 def validate_remote_url(url):
     parsed=urllib.parse.urlparse(url)
@@ -1174,6 +2676,20 @@ def research(query, limit=5, fetch=False):
         for item in results: item["page_text"]=fetch_page(item["url"])["text"]
     return {"query":query,"results":results}
 
+def web_intent(p):
+    """True when a plain chat prompt asks for live/recent internet information.
+
+    Deliberately lenient: real-world prompts like "recent events in Varna
+    Bulgaria today" should trigger live browsing instead of a stale refusal.
+    """
+    pl=(p or "").lower()
+    if re.search(r"\b(what is|what are|what's|who is|who's|when did|when is|where is|where are|how to|how does|how do|how much|how many|define|explain|tell me about|meaning of|history of|facts about|why did|is it|are there|what was|is there)\b",pl): return True
+    if re.search(r"\b(search|look up|lookup|find|check|weather|forecast|news|score|price|stock|currency|exchange|latest|updates|recent|events|today|tomorrow|yesterday|breaking|traffic|map|directions|hotels|flights|flight|arrival|arrivals|arrive|arriving|depart|departure|live|tracker|tracking|track|status|eta|scheduled|landing|gate|schedule|results|happened|open now|vuelo|vuelos|vuelos|precio|precios|billete|billetes|buscar|busca|buscame|horario|horarios|llegada|llegadas|salida|salidas|aeropuerto|hotel|hoteles|clima|noticias|noticia|partido|resultado|reserva|reservar|barato|tren|trenes|dolar|euro|cambio|conversion|en vivo|quien|cuando|donde|cual|cuanto)\b",pl): return True
+    # A capitalized proper noun (place/person) with an info-seeking verb or
+    # time/location cue strongly suggests a lookup.
+    if re.search(r"[A-Z][a-z]{2,}",p) and re.search(r"\b(is|are|was|were|did|does|in|at|near|today|now|latest)\b",pl): return True
+    return False
+
 def complexity_score(p):
     if len(p)>7000 or re.search(r"\b(analyze|debug|architect|prove|compare|research|multi[- ]step|plan)\b",p,re.I): return "reasoning"
     if re.search(r"```|\b(code|function|class|script|sql|regex|api)\b",p,re.I): return "coding"
@@ -1191,7 +2707,37 @@ def candidates(prompt):
     available=[m for m in ordered if HEALTH.get(m["name"],{}).get("cooldown_until",0)<=now]
     return available or ordered
 
+def _api_base(m):
+    """Normalize an OpenAI-compatible base URL to include a /v1 version segment."""
+    base=m["url"].rstrip("/")
+    if not re.search(r"/v\d+(/)?$", base):
+        base+="/v1"
+    return base
+
+def discover_local_models():
+    """Query the configured local endpoint's /models for the real served model IDs."""
+    m=worker_model()
+    if not m or not m.get("url"): return []
+    try:
+        req=urllib.request.Request(_api_base(m)+"/models",headers={"Authorization":"Bearer "+m.get("key","")} if m.get("key") else {})
+        with urllib.request.urlopen(req,timeout=8) as r: data=json.loads(r.read().decode())
+        return [x.get("id") for x in data.get("data",[]) if x.get("id")]
+    except Exception: return []
+
+def resolve_local_model_id(m):
+    """Map a configured local model name to a real served ID (exact, substring, else first)."""
+    if m.get("kind")!="local": return m["name"]
+    ids=discover_local_models()
+    if not ids: return m["name"]
+    if m["name"] in ids: return m["name"]
+    base=m["name"].split("/")[-1].lower()
+    for i in ids:
+        if i.lower()==base or base in i.lower() or i.lower() in base: return i
+    return ids[0]
+
 def request(m,payload,stream=False):
+    if m.get("kind")=="local":
+        payload={**payload,"model":resolve_local_model_id(m)}
     if m.get("kind")=="anthropic":
         messages=[]; system_text=""
         for msg in payload.get("messages",[]):
@@ -1200,7 +2746,7 @@ def request(m,payload,stream=False):
         body={"model":m["name"],"max_tokens":int(payload.get("max_tokens",512)),"messages":messages}
         if system_text: body["system"]=system_text.strip()
         headers={"Content-Type":"application/json","x-api-key":m.get("key","")+"","anthropic-version":"2023-06-01"}
-        req=urllib.request.Request(m["url"].rstrip("/")+"/messages",json.dumps(body).encode(),headers,"POST")
+        req=urllib.request.Request(_api_base(m)+"/messages",json.dumps(body).encode(),headers,"POST")
         try:
             r=urllib.request.urlopen(req,timeout=int(os.getenv("OPENCLAW_TIMEOUT","120"))); data=json.loads(r.read().decode()); text="".join(x.get("text","") for x in data.get("content",[]) if isinstance(x,dict))
             return {"id":data.get("id"),"choices":[{"message":{"role":"assistant","content":text}}],"usage":data.get("usage",{})}
@@ -1208,7 +2754,7 @@ def request(m,payload,stream=False):
         except Exception as e: raise RuntimeError(str(e))
     headers={"Content-Type":"application/json"}
     if m["key"]: headers["Authorization"]="Bearer "+m["key"]
-    req=urllib.request.Request(m["url"].rstrip("/")+"/chat/completions",json.dumps(payload).encode(),headers,"POST")
+    req=urllib.request.Request(_api_base(m)+"/chat/completions",json.dumps(payload).encode(),headers,"POST")
     try:
         r=urllib.request.urlopen(req,timeout= int(os.getenv("OPENCLAW_TIMEOUT","120")))
         if not stream: return json.loads(r.read().decode())
@@ -1237,12 +2783,19 @@ def supervisor_budget_ok(estimated_tokens=0):
 
 def get_model(name):
     return next((m for m in MODELS if m.get("name")==name), None)
-def chat(prompt, conversation="default", system=None, stream=False, json_mode=False, requested=None, max_tokens=None, use_memory=True):
+def chat(prompt, conversation="default", system=None, stream=False, json_mode=False, requested=None, max_tokens=None, use_memory=True, history=None):
     log_event("chat_started",conversation=conversation,task=complexity_score(prompt),requested_model=requested)
     memories=mem_search(prompt,int(os.getenv("MEMPALACE_RESULTS","5"))) if use_memory and os.getenv("MEMPALACE_ENABLED","1")!="0" else []
     context=(system or os.getenv("OPENCLAW_SYSTEM","You are a reliable assistant."))
     if memories: context += "\nRelevant MemPalace memories:\n"+"\n".join("- ["+m["category"]+"] "+m["text"] for m in memories)
-    messages=[{"role":"system","content":context},{"role":"user","content":prompt}]
+    messages=[{"role":"system","content":context}]
+    if isinstance(history,list):
+        for h in history[-12:]:
+            role=str(h.get("role","")) if isinstance(h,dict) else ""
+            content=str(h.get("content","")) if isinstance(h,dict) else ""
+            if role in {"user","assistant"} and content:
+                messages.append({"role":role,"content":content})
+    messages.append({"role":"user","content":prompt})
     is_supervisor=bool(requested and requested!=worker_model_name() and any(m["name"]==requested and m.get("kind") in {"openai_compatible","anthropic"} for m in MODELS))
     token_limit=max_tokens or (int(os.getenv("SUPERVISOR_MAX_TOKENS","512")) if is_supervisor else int(os.getenv("OPENCLAW_MAX_TOKENS","2048")))
     if is_supervisor:
@@ -1267,7 +2820,10 @@ def chat(prompt, conversation="default", system=None, stream=False, json_mode=Fa
         if not stream and os.getenv("OPENCLAW_CACHE","1")!="0":
             row=DB.execute("SELECT value,expires FROM cache WHERE key=?",(key,)).fetchone()
             if row and (not row[1] or row[1]>int(time.time())):
-                try: return validate_response(json.loads(row[0]))
+                try:
+                    data=validate_response(json.loads(row[0]))
+                    data["_model"]=m["name"]; data["_provider"]=m.get("provider",""); data["_role"]=m.get("role","")
+                    return data
                 except (ValueError,json.JSONDecodeError): DB.execute("DELETE FROM cache WHERE key=?",(key,)); DB.commit()
         for attempt in range(int(os.getenv("OPENCLAW_RETRIES","2"))+1):
             try:
@@ -1282,9 +2838,10 @@ def chat(prompt, conversation="default", system=None, stream=False, json_mode=Fa
                     DB.execute("INSERT OR REPLACE INTO cache VALUES(?,?,?)",(key,json.dumps(result),int(time.time())+int(os.getenv("OPENCLAW_CACHE_TTL","3600")))); DB.commit()
                     answer=result.get("choices",[{}])[0].get("message",{}).get("content","")
                     if os.getenv("MEMPALACE_AUTO_CAPTURE","0")=="1": mem_add(prompt,"conversation",[conversation],.35)
+                result["_model"]=m["name"]; result["_provider"]=m.get("provider",""); result["_role"]=m.get("role","")
                 return result
             except RuntimeError as e:
-                last=f"{m['name']}: {e}"; log_event("model_failure",model=m["name"],error=str(e)[:300]); h=HEALTH.setdefault(m["name"],{"successes":0,"failures":0}); h["failures"]+=1; h["last_error"]=str(e)[:400]
+                last=f"{m['name']}: {e}"; log_event("model_failure",model=m["name"],error=str(e)[:300]); log_error("model:"+m["name"],e); h=HEALTH.setdefault(m["name"],{"successes":0,"failures":0}); h["failures"]+=1; h["last_error"]=str(e)[:400]
                 if h["failures"]>=3: h["cooldown_until"]=int(time.time())+60
                 save_health(); time.sleep(1.5**attempt)
     raise RuntimeError("all models failed: "+last)
@@ -1293,7 +2850,7 @@ def discover():
     out=[]
     for m in MODELS:
         try:
-            req=urllib.request.Request(m["url"].rstrip("/")+"/models",headers={"Authorization":"Bearer "+m["key"]} if m["key"] else {})
+            req=urllib.request.Request(_api_base(m)+"/models",headers={"Authorization":"Bearer "+m["key"]} if m["key"] else {})
             with urllib.request.urlopen(req,timeout=15) as r: out += [{"provider":m["name"],"id":x.get("id")} for x in json.loads(r.read()).get("data",[])]
         except Exception as e: out.append({"provider":m["name"],"error":str(e)})
     print(json.dumps(out,indent=2))
@@ -1524,6 +3081,128 @@ def save_env(key,value):
     os.environ[key]=value.strip()
     log_event("provider_key_saved",key=key)
 
+def _key_set(k):
+    return bool(os.getenv(k,"").strip())
+
+PRESET_SETTINGS=[
+ {"key":"OPENCLAW_SYSTEM","label":"System prompt","section":"general","type":"textarea","default":"You are a reliable assistant.","hint":"Base system prompt for all chats."},
+ {"key":"OPENCLAW_TEMPERATURE","label":"Temperature","section":"general","type":"text","default":"0.2","hint":"Sampling temperature for model calls."},
+ {"key":"OPENCLAW_MAX_TOKENS","label":"Max tokens (worker)","section":"general","type":"text","default":"2048"},
+ {"key":"OPENCLAW_TIMEOUT","label":"HTTP timeout (seconds)","section":"general","type":"text","default":"120"},
+ {"key":"OPENCLAW_RETRIES","label":"Retries per model","section":"general","type":"text","default":"2"},
+ {"key":"OPENCLAW_CACHE","label":"Response cache enabled","section":"general","type":"select","default":"1","options":["1","0"]},
+ {"key":"OPENCLAW_CACHE_TTL","label":"Cache TTL (seconds)","section":"general","type":"text","default":"3600"},
+ {"key":"OPENCLAW_MAX_GOAL_CHARS","label":"Max goal length (chars)","section":"general","type":"text","default":"10000"},
+ {"key":"OPENCLAW_ALLOWED_ROOTS","label":"Allowed roots","section":"general","type":"textarea","default":"","hint":"Colon-separated directories the worker may access."},
+ {"key":"OPENCLAW_WORKDIR","label":"Default work directory","section":"general","type":"text","default":""},
+ {"key":"OPENCLAW_WEB_PORT","label":"Control web port","section":"general","type":"text","default":"8765"},
+ {"key":"OPENCLAW_ONLINE_PROVIDERS","label":"Extra online providers (JSON array)","section":"general","type":"textarea","default":"[]","hint":"Each: {model, base_url, api_key, api_key_env, provider, weight, context_window, kind, no_auth}"},
+ {"key":"SUPERVISOR_MODEL","label":"Supervisor model","section":"supervisor","type":"text","default":"","hint":"Online model used for planning/review."},
+ {"key":"SUPERVISOR_ENABLED","label":"Supervisor enabled","section":"supervisor","type":"select","default":"1","options":["1","0"]},
+ {"key":"SUPERVISOR_DAILY_CALLS","label":"Supervisor daily call limit","section":"supervisor","type":"text","default":"5"},
+ {"key":"SUPERVISOR_DAILY_TOKENS","label":"Supervisor daily token limit","section":"supervisor","type":"text","default":"3000"},
+ {"key":"SUPERVISOR_MAX_TOKENS","label":"Supervisor max tokens","section":"supervisor","type":"text","default":"512"},
+ {"key":"API_CONTEXT_WINDOW","label":"API context window","section":"supervisor","type":"text","default":"32768"},
+ {"key":"API_PLAN_MODEL","label":"Plan model","section":"supervisor","type":"text","default":""},
+ {"key":"API_REVIEW_MODEL","label":"Review model","section":"supervisor","type":"text","default":""},
+ {"key":"DEEPSEEK_PLAN_MAX_TOKENS","label":"Plan max tokens","section":"supervisor","type":"text","default":"1536"},
+ {"key":"DEEPSEEK_REVIEW_TOKENS","label":"Review tokens","section":"supervisor","type":"text","default":"384"},
+ {"key":"LOCAL_CONTEXT_WINDOW","label":"Local context window","section":"local","type":"text","default":"32768"},
+ {"key":"LOCAL_VISION_TOKENS","label":"Local vision tokens","section":"local","type":"text","default":"1200"},
+ {"key":"LOCAL_MAX_TOKENS","label":"Local max tokens","section":"local","type":"text","default":"2048"},
+ {"key":"LOCAL_WRITE_ENABLED","label":"Allow local file writes","section":"local","type":"select","default":"1","options":["1","0"]},
+ {"key":"LOCAL_TERMINAL_ENABLED","label":"Local terminal enabled","section":"local","type":"select","default":"1","options":["1","0"]},
+ {"key":"LOCAL_TERMINAL_POLICY","label":"Terminal policy","section":"local","type":"select","default":"worker","options":["safe","worker","unrestricted"]},
+ {"key":"LOCAL_TERMINAL_ALLOW_ALL","label":"Allow all terminal commands","section":"local","type":"select","default":"0","options":["1","0"],"hint":"Requires OPENCLAW_UNSAFE_MODE=I_UNDERSTAND too."},
+ {"key":"TERMINAL_MAX_TIMEOUT","label":"Terminal max timeout (seconds)","section":"local","type":"text","default":"900"},
+ {"key":"LOCAL_VERIFY_TIMEOUT","label":"Verify command timeout (seconds)","section":"local","type":"text","default":"180"},
+ {"key":"MAX_DIFF_CHARS","label":"Max diff characters","section":"local","type":"text","default":"12000"},
+ {"key":"CONTEXT_SAFETY_MARGIN","label":"Context safety margin (tokens)","section":"local","type":"text","default":"512"},
+ {"key":"MAX_REPAIR_CYCLES","label":"Max repair cycles","section":"local","type":"text","default":"3"},
+ {"key":"MEMPALACE_ENABLED","label":"MemPalace memory enabled","section":"memory","type":"select","default":"1","options":["1","0"]},
+ {"key":"MEMPALACE_RESULTS","label":"MemPalace results per query","section":"memory","type":"text","default":"5"},
+ {"key":"MEMPALACE_AUTO_CAPTURE","label":"Auto-capture conversations","section":"memory","type":"select","default":"0","options":["1","0"]},
+ {"key":"OPENCLAW_ALLOW_PRIVATE_URLS","label":"Allow private/LAN URLs","section":"security","type":"select","default":"0","options":["1","0"]},
+ {"key":"OPENCLAW_UNSAFE_MODE","label":"Unsafe mode (dangerous)","section":"security","type":"text","default":"","hint":"Set to I_UNDERSTAND to allow unrestricted terminal."},
+ {"key":"ALLOW_INSTALL","label":"Allow dependency auto-install","section":"security","type":"select","default":"0","options":["1","0"]},
+]
+PRESET_KEYS={p["key"] for p in PRESET_SETTINGS}
+PRESET_SECTIONS=("general","local","supervisor","memory","security")
+
+def settings_status():
+    presets=[]
+    for p in PRESET_SETTINGS:
+        presets.append({**p,"value":os.getenv(p["key"],p.get("default",""))})
+    return {"worker_model":worker_model_name(),
+            "local_url":os.getenv("LOCAL_URL",os.getenv("OLLAMA_BASE_URL","")),
+            "local_model":os.getenv("LOCAL_MODEL","qwen2.5-coder:14b"),
+            "local_context_window":os.getenv("LOCAL_CONTEXT_WINDOW","32768"),
+            "local_key_set":_key_set("LOCAL_KEY"),
+            "openai_set":_key_set("OPENAI_API_KEY"),
+            "openai_model":os.getenv("OPENAI_MODEL","gpt-4o-mini"),
+            "openai_base_url":os.getenv("OPENAI_BASE_URL","https://api.openai.com/v1"),
+            "anthropic_set":_key_set("ANTHROPIC_API_KEY"),
+            "anthropic_model":os.getenv("ANTHROPIC_MODEL","claude-3-5-haiku-latest"),
+            "anthropic_base_url":os.getenv("ANTHROPIC_BASE_URL","https://api.anthropic.com/v1"),
+            "deepseek_set":_key_set("DEEPSEEK_API_KEY"),
+            "deepseek_model":os.getenv("DEEPSEEK_MODEL","deepseek-chat"),
+            "deepseek_base_url":os.getenv("DEEPSEEK_BASE_URL","https://api.deepseek.com/v1"),
+            "sections":list(PRESET_SECTIONS),
+            "presets":presets,
+            "models":[{"name":m["name"],"provider":m.get("provider"),"role":m.get("role")} for m in MODELS]}
+
+def apply_settings(data):
+    if not isinstance(data,dict): raise ValueError("settings must be a JSON object")
+    allowed=set(("OPENAI_API_KEY","OPENAI_MODEL","OPENAI_BASE_URL","ANTHROPIC_API_KEY","ANTHROPIC_MODEL","ANTHROPIC_BASE_URL","DEEPSEEK_API_KEY","DEEPSEEK_MODEL","DEEPSEEK_BASE_URL","LOCAL_URL","LOCAL_MODEL","LOCAL_KEY","LOCAL_CONTEXT_WINDOW"))|PRESET_KEYS
+    changed=[]
+    for k in allowed:
+        v=data.get(k)
+        if v is None: continue
+        v=str(v).strip()
+        if not v: continue
+        save_env(k,v); changed.append(k)
+    build_models()
+    log_event("settings_updated",fields=changed)
+    return {"ok":True,"changed":changed,"status":settings_status()}
+
+def web_terminal(command, cwd=None):
+    if os.getenv("LOCAL_TERMINAL_ENABLED","1")=="0": return {"ok":False,"error":"terminal disabled by LOCAL_TERMINAL_ENABLED"}
+    command=str(command or "").strip()
+    if not command: return {"ok":False,"error":"command is empty"}
+    try: cwd=str(allowed_path(cwd or str(Path.cwd()),True))
+    except Exception as e: return {"ok":False,"error":str(e)}
+    if not Path(cwd).is_dir(): return {"ok":False,"error":"working directory does not exist"}
+    try: parts=__import__("shlex").split(command)
+    except ValueError as e: return {"ok":False,"error":"invalid shell quoting: "+str(e)}
+    if not parts: return {"ok":False,"error":"command is empty"}
+    timeout=max(1,min(120,int(os.getenv("TERMINAL_MAX_TIMEOUT","900"))))
+    policy=os.getenv("LOCAL_TERMINAL_POLICY","worker").lower()
+    if policy not in {"safe","worker","unrestricted"}: policy="worker"
+    safe_bins={"pwd","ls","cat","echo","printf","grep","find","head","tail","wc","sort","uniq","cut","paste","diff","patch","ps","top","df","du","uname","whoami","python3","python","node","pytest","ruff","go","swift","ollama"}
+    worker_bins=safe_bins|{"npm","pnpm","pip","git","make","cargo","rustc","xcodebuild","brew"}
+    allowed_bins=safe_bins if policy=="safe" else worker_bins
+    unrestricted=policy=="unrestricted" and os.getenv("LOCAL_TERMINAL_ALLOW_ALL","0")=="1" and os.getenv("OPENCLAW_UNSAFE_MODE","")=="I_UNDERSTAND"
+    dangerous=re.search(r"(^|[;&|])(rm\s+-rf|mkfs|diskutil\s+erase|shutdown|reboot|sudo\s+|git\s+reset\s+--hard|dd\s+if=|chmod\s+-R\s+000|:\(\)\s*\{)",command,re.I)
+    if not unrestricted and (parts[0].split("/")[-1].lower() not in allowed_bins or re.search(r"[;&|`]",command) or dangerous):
+        return {"ok":False,"error":"command blocked by terminal safety policy","policy":policy,"hint":"Set LOCAL_TERMINAL_POLICY=unrestricted and LOCAL_TERMINAL_ALLOW_ALL=1 (and OPENCLAW_UNSAFE_MODE=I_UNDERSTAND) to run arbitrary commands"}
+    try:
+        r=subprocess.run(parts,shell=False,cwd=cwd,capture_output=True,text=True,timeout=timeout,env=os.environ.copy())
+        log_event("web_terminal",command=command,cwd=cwd,returncode=r.returncode)
+        return {"ok":r.returncode==0,"command":command,"cwd":cwd,"stdout":r.stdout[-30000:],"stderr":r.stderr[-10000:],"returncode":r.returncode,"timed_out":False,"policy":policy}
+    except subprocess.TimeoutExpired as e:
+        log_event("web_terminal_timeout",command=command,cwd=cwd)
+        return {"ok":False,"command":command,"cwd":cwd,"stdout":(e.stdout or "")[-30000:] if isinstance(e.stdout,str) else "","stderr":(e.stderr or "")[-10000:] if isinstance(e.stderr,str) else "","returncode":None,"timed_out":True,"policy":policy}
+
+def system_resources():
+    info={"cpu_percent":None,"mem_used_mb":None,"mem_total_mb":None,"mem_percent":None,"disk_used_gb":None,"disk_total_gb":None,"disk_percent":None,"uptime_seconds":None}
+    try:
+        import psutil
+        vm=psutil.virtual_memory(); du=psutil.disk_usage(str(ROOT))
+        info.update({"cpu_percent":round(psutil.cpu_percent(interval=0.5),1),"mem_used_mb":round(vm.used/1048576),"mem_total_mb":round(vm.total/1048576),"mem_percent":round(vm.percent,1),"disk_used_gb":round(du.used/1073741824,1),"disk_total_gb":round(du.total/1073741824,1),"disk_percent":round(du.percent,1),"uptime_seconds":int(time.time()-psutil.boot_time())})
+    except Exception:
+        pass
+    return info
+
 def setup_menu():
     """Interactive first-run menu: enter API keys / configure a local endpoint."""
     print("\n=== OpenClaw Setup ===")
@@ -1598,6 +3277,17 @@ def backup():
             if fp.exists(): t.add(fp,arcname=fn)
     log_event("backup_created",path=str(out)); print(json.dumps({"backup":str(out),"bytes":out.stat().st_size}))
 
+def make_backup():
+    import tarfile
+    stamp=time.strftime("%Y%m%d-%H%M%S"); out=ROOT/f"openclaw-backup-{stamp}.tar.gz"; out.parent.mkdir(parents=True,exist_ok=True)
+    DB.commit()
+    with tarfile.open(out,"w:gz") as t:
+        t.add(DB_PATH,arcname="mempalace.sqlite3")
+        for fn in ("activity.jsonl","task_state.json","learning_state.json","health.json","todos.json","errors.jsonl"):
+            fp=ROOT/fn
+            if fp.exists(): t.add(fp,arcname=fn)
+    log_event("backup_created",path=str(out)); return {"ok":True,"path":str(out),"bytes":out.stat().st_size}
+
 def main():
     daily_learn()
     p=argparse.ArgumentParser(description="OpenClaw hybrid gateway with MemPalace")
@@ -1621,6 +3311,7 @@ def main():
     s.add_parser("system", help="show a combined system/health report")
     dc=s.add_parser("doctor", help="run the install checklist and auto-troubleshoot"); dc.add_argument("--auto",action="store_true"); dc.add_argument("--json",action="store_true"); dc.add_argument("--report")
     s.add_parser("install", help="run install checklist with auto-fix (alias for doctor --auto)")
+    s.add_parser("serve", help="run web Control Center + background agent daemon in the foreground (headless service)")
     s.add_parser("setup", help="alias for install")
     s.add_parser("providers", help="list configured local and online AI providers")
     s.add_parser("capabilities", help="show model capability metadata")
@@ -1672,6 +3363,17 @@ def main():
         if x.json: print(json.dumps(res,indent=2))
         elif x.report: print(json.dumps(doctor_report(x.report,res),indent=2))
         else: print_doctor(res)
+    elif x.cmd=="serve":
+        print("OpenClaw service mode: web Control Center + background agent daemon (Ctrl-C to stop).")
+        try:
+            started=run_all(os.getenv("OPENCLAW_WEB_PORT","8765"))
+            if any(k=="web" for k,_ in started): print(f"[ web ] Control Center at http://127.0.0.1:{os.getenv('OPENCLAW_WEB_PORT','8765')}")
+            if any(k=="agent" for k,_ in started): print("[ agent ] background agent daemon running")
+        except Exception as e:
+            print("[ services ] could not start: ",e)
+        try:
+            while True: time.sleep(3600)
+        except KeyboardInterrupt: pass
     elif x.cmd in ("install","setup"):
         if not preinstall_cleanup(): sys.exit(1)
         os.environ["ALLOW_INSTALL"]="1"
@@ -1679,8 +3381,23 @@ def main():
         print_doctor(res)
         if not res["all_ok"]:
             print("\n[ warn ] Installation finished with issues (you can still start OpenClaw, but set a model later to use AI features).\n")
-        print("Starting OpenClaw interactive session (type 'exit' to quit)...\n")
-        repl()
+        print("Starting OpenClaw services (web + background agent)...")
+        try:
+            started=run_all(os.getenv("OPENCLAW_WEB_PORT","8765"))
+            if any(k=="web" for k,_ in started):
+                print(f"[ web ] Control Center at http://127.0.0.1:{os.getenv('OPENCLAW_WEB_PORT','8765')}  (set OPENCLAW_WEB_DISABLE=1 to skip)")
+            if any(k=="agent" for k,_ in started):
+                print("[ agent ] background agent daemon running (submit goals from the web)")
+        except Exception as e:
+            print("[ services ] could not start: ",e)
+        print("\nStarting OpenClaw interactive session (type 'exit' to quit)...\n")
+        if not sys.stdin.isatty():
+            print("[ services ] no TTY detected; staying in headless service mode (press Ctrl-C to stop).")
+            try:
+                while True: time.sleep(3600)
+            except KeyboardInterrupt: pass
+        else:
+            repl()
     elif x.cmd=="health": print(json.dumps(HEALTH,indent=2))
     elif x.cmd=="discover": discover()
     elif x.cmd=="search": print(json.dumps(research(x.query,x.limit,x.fetch),indent=2))
