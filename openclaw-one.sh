@@ -2759,15 +2759,30 @@ def request(m,payload,stream=False):
         r=urllib.request.urlopen(req,timeout= int(os.getenv("OPENCLAW_TIMEOUT","120")))
         if not stream: return json.loads(r.read().decode())
         def chunks():
+            buf=b""; saw_data=False
             for raw in r:
                 line=raw.decode(errors="ignore").strip()
-                if not line.startswith("data:"): continue
-                val=line[5:].strip()
-                if val=="[DONE]": break
+                if not line or line.startswith(":"): continue
+                if line.startswith("data:"):
+                    saw_data=True; buf=b""
+                    val=line[5:].strip()
+                    if val=="[DONE]": break
+                    try:
+                        d=json.loads(val).get("choices",[{}])[0].get("delta",{}).get("content","")
+                        if d: yield d
+                    except Exception: pass
+                elif not saw_data:
+                    # Non-SSE: a gateway/server may ignore "stream":true and
+                    # reply with a single JSON document. Buffer it (bounded) so
+                    # we can fall back to reading content from it.
+                    buf+=raw
+                    if len(buf)>262144: raise RuntimeError("stream parse failed: response is neither SSE nor JSON")
+            if not saw_data and buf:
                 try:
-                    d=json.loads(val).get("choices",[{}])[0].get("delta",{}).get("content","")
+                    d=json.loads(buf.decode(errors="ignore")).get("choices",[{}])[0].get("message",{}).get("content","")
                     if d: yield d
-                except Exception: pass
+                except Exception:
+                    raise RuntimeError("model returned a non-JSON, non-SSE streaming response")
         return chunks()
     except urllib.error.HTTPError as e: raise RuntimeError(f"HTTP {e.code}: {e.read().decode(errors='ignore')[:400]}")
     except Exception as e: raise RuntimeError(str(e))
@@ -2838,13 +2853,24 @@ def chat(prompt, conversation="default", system=None, stream=False, json_mode=Fa
                     DB.execute("INSERT OR REPLACE INTO cache VALUES(?,?,?)",(key,json.dumps(result),int(time.time())+int(os.getenv("OPENCLAW_CACHE_TTL","3600")))); DB.commit()
                     answer=result.get("choices",[{}])[0].get("message",{}).get("content","")
                     if os.getenv("MEMPALACE_AUTO_CAPTURE","0")=="1": mem_add(prompt,"conversation",[conversation],.35)
-                result["_model"]=m["name"]; result["_provider"]=m.get("provider",""); result["_role"]=m.get("role","")
+                    result["_model"]=m["name"]; result["_provider"]=m.get("provider",""); result["_role"]=m.get("role","")
                 return result
             except RuntimeError as e:
                 last=f"{m['name']}: {e}"; log_event("model_failure",model=m["name"],error=str(e)[:300]); log_error("model:"+m["name"],e); h=HEALTH.setdefault(m["name"],{"successes":0,"failures":0}); h["failures"]+=1; h["last_error"]=str(e)[:400]
                 if h["failures"]>=3: h["cooldown_until"]=int(time.time())+60
                 save_health(); time.sleep(1.5**attempt)
     raise RuntimeError("all models failed: "+last)
+
+def model_output_iter(r):
+    # Normalize the return of chat()/request() for streaming call sites.
+    # OpenAI-compatible providers stream (returning an iterator of text chunks),
+    # but the Anthropic branch (and some gateways) return a plain non-streamed
+    # dict. Treat a dict as a single whole chunk so callers can iterate either
+    # shape without printing dict keys.
+    if isinstance(r, dict):
+        text=r.get("choices",[{}])[0].get("message",{}).get("content","") or ""
+        return iter([text])
+    return r
 
 def discover():
     out=[]
@@ -3244,6 +3270,9 @@ def repl():
         setup_menu()
         if not MODELS: print("[ warn ] Still no model configured; type /setup any time to add one.")
     history=[]
+    def _stop_pressed(sig,frame):
+        raise KeyboardInterrupt
+    import signal as _sig
     while True:
         try: line=input("openclaw> ").strip()
         except (EOFError,KeyboardInterrupt): print(); return
@@ -3251,7 +3280,7 @@ def repl():
         if line in {"/exit","/quit","quit"}: return
         if line in {"/help","help"}:
             print("Commands: /setup  /providers  /memory  /exit")
-            print("Or type any message to chat with the configured model.")
+            print("To stop an in-progress response, press Ctrl-C.")
             continue
         if line in {"/setup","setup"}: setup_menu(); continue
         if line in {"/providers","providers"}:
@@ -3263,8 +3292,22 @@ def repl():
             print("[ error ] No model configured. Run /setup to add an API key or local endpoint.")
             continue
         history.append(line)
-        r=chat(line,conversation="repl")
-        print(r.get("choices",[{}])[0].get("message",{}).get("content",""))
+        prev=_sig.signal(_sig.SIGINT,_stop_pressed)
+        printed=0
+        try:
+            r=chat(line,conversation="repl",stream=True)
+            print("OpenClaw: ",end="",flush=True)
+            for z in model_output_iter(r):
+                if z: printed+=1
+                print(z,end="",flush=True)
+            print()
+            if not printed: print("[ warn ] Model returned no streaming output (unsupported or empty).")
+        except KeyboardInterrupt:
+            print("\n[ stopped ] Response cancelled.")
+        except Exception as e:
+            print("\n[ error ] Response failed: "+str(e))
+        finally:
+            _sig.signal(_sig.SIGINT,prev)
 
 def backup():
     import shutil, tarfile
@@ -3411,8 +3454,12 @@ def main():
     else:
         r=chat(x.prompt,x.conversation,x.system,x.stream,x.json,x.model)
         if x.stream:
-            for z in r: print(z,end="",flush=True)
+            printed=0
+            for z in model_output_iter(r):
+                if z: printed+=1
+                print(z,end="",flush=True)
             print()
+            if not printed: print("[ warn ] Model returned no streaming output (unsupported or empty).")
         else: print(r.get("choices",[{}])[0].get("message",{}).get("content",""))
 if __name__=="__main__":
     try: main()
