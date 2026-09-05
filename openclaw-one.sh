@@ -1100,6 +1100,8 @@ def run_all(web_port=8765):
         started.append(("agent",start_agent_worker()))
     else:
         print("[ agent ] background agent disabled (OPENCLAW_AGENT_DISABLE=1)")
+    try: ensure_comms()
+    except Exception: pass
     return started
 
 FRONTEND_HTML = '''<!doctype html>
@@ -1108,19 +1110,24 @@ FRONTEND_HTML = '''<!doctype html>
 <title>OpenClaw Control Center</title>
 <style>
 :root{
-  --bg:#0b0f17; --panel:#121826; --panel2:#161d2f; --line:#232c42;
-  --txt:#e8eefc; --muted:#8b97b1; --accent:#5b8cff; --accent2:#7dd3fc;
-  --ok:#37d67a; --warn:#f5b84b; --bad:#f26d6d; --code:#0d1117;
+  --bg:#0a0f1a; --panel:#111827; --panel2:#16213a; --panel3:#1c2a47; --line:#26334f;
+  --txt:#eaf1ff; --muted:#93a3c2; --accent:#5b8cff; --accent2:#7de0f5;
+  --accent-ink:#0d1526;
+  --ok:#34d399; --warn:#fbbf24; --bad:#fb7185; --code:#0a0e17;
+  --shadow:0 12px 32px rgba(2,6,18,.45); --soft-shadow:0 1px 2px rgba(2,6,18,.4);
+  --ring:0 0 0 3px rgba(91,140,255,.28);
 }
-*{box-sizing:border-box}
+*{box-sizing:border-box;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}
 html,body{height:100%}
 html{font-size:var(--fs,14px)}
-body{margin:0;font:1rem/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;background:var(--bg);color:var(--txt)}
+body{margin:0;font:1rem/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,"Helvetica Neue",Arial,ui-sans-serif,sans-serif;background:var(--bg);color:var(--txt);letter-spacing:.1px}
 a{color:var(--accent2);text-decoration:none}
+a:hover{text-decoration:underline;color:#9fe9fb}
+:focus-visible{outline:none;box-shadow:var(--ring);border-radius:8px}
 .layout{display:grid;grid-template-columns:230px 1fr;height:100vh}
 /* Sidebar */
-.side{background:var(--panel);border-right:1px solid var(--line);display:flex;flex-direction:column;min-height:0}
-.brand{padding:18px 18px 14px;border-bottom:1px solid var(--line)}
+.side{background:linear-gradient(180deg,var(--panel2),var(--panel));border-right:1px solid var(--line);display:flex;flex-direction:column;min-height:0}
+.brand{padding:18px 18px 14px;border-bottom:1px solid var(--line);background:linear-gradient(180deg,rgba(91,140,255,.08),transparent)}
 .brand .logo{font-weight:800;font-size:1.143rem;letter-spacing:.4px;color:#fff}
 .brand .logo span{color:var(--accent2)}
 .brand .ver{color:var(--muted);font-size:0.786rem;margin-top:2px}
@@ -1145,7 +1152,7 @@ a{color:var(--accent2);text-decoration:none}
 .search-drop .sd-hd{padding:6px 10px;font-size:0.714rem;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
 .search-drop a{display:block;padding:8px 10px;font-size:0.857rem;color:var(--txt);border-top:1px solid var(--line)}
 .search-drop a:hover{background:var(--panel2)}
-.badge{font-size:0.786rem;padding:3px 9px;border-radius:20px;background:var(--panel2);border:1px solid var(--line);color:var(--muted)}
+.badge{font-size:0.786rem;padding:3px 9px;border-radius:20px;background:var(--panel2);border:1px solid var(--line);color:var(--muted);font-weight:500;white-space:nowrap}
 .badge.on{color:var(--ok);border-color:rgba(55,214,122,.4)}
 .badge.err{color:var(--bad);border-color:rgba(242,109,109,.4)}
 .view{display:none;animation:fade .18s ease}
@@ -1153,14 +1160,14 @@ a{color:var(--accent2);text-decoration:none}
 @keyframes fade{from{opacity:0;transform:translateY(4px)}to{opacity:1}}
 /* Cards */
 .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-bottom:20px}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px}
+.card{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:12px;padding:16px;box-shadow:var(--soft-shadow)}
 .card .label{color:var(--muted);font-size:0.786rem;text-transform:uppercase;letter-spacing:.5px}
 .card .val{font-size:1.714rem;font-weight:700;margin-top:6px}
 .card .val.small{font-size:1.143rem}
 .card .sub{color:var(--muted);font-size:0.857rem;margin-top:4px}
 /* Panels/tables */
-.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;margin-bottom:18px;overflow:hidden}
-.panel .hd{padding:12px 16px;border-bottom:1px solid var(--line);font-weight:600;font-size:0.929rem;display:flex;align-items:center;gap:8px}
+.panel{background:linear-gradient(180deg,var(--panel),var(--panel));border:1px solid var(--line);border-radius:12px;margin-bottom:18px;overflow:hidden;box-shadow:var(--soft-shadow)}
+.panel .hd{padding:12px 16px;border-bottom:1px solid var(--line);font-weight:600;font-size:0.929rem;display:flex;align-items:center;gap:8px;background:rgba(148,163,205,.05);color:var(--txt)}
 .panel.collapsible .hd{cursor:pointer;user-select:none}
 .panel.collapsible .hd:hover{background:var(--panel2)}
 .panel.collapsed .bd{display:none}
@@ -1172,17 +1179,20 @@ th{color:var(--muted);font-weight:600;font-size:0.786rem;text-transform:uppercas
 tr:last-child td{border-bottom:0}
 code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:0.857rem}
 pre{background:var(--code);border:1px solid var(--line);border-radius:8px;padding:12px;overflow:auto;white-space:pre-wrap;word-break:break-word}
-.chip{display:inline-block;font-size:0.786rem;padding:1px 8px;border-radius:12px;background:rgba(91,140,255,.15);color:var(--accent2);margin:1px}
+.chip{display:inline-block;font-size:0.786rem;padding:2px 9px;border-radius:12px;background:var(--accent-soft, rgba(91,140,255,.16));color:var(--accent2);margin:1px;border:1px solid rgba(125,224,245,.14)}
 .model-badge{margin-left:6px;font-size:0.714rem;padding:1px 7px;text-transform:none;vertical-align:middle}
 .model-badge.online{background:rgba(245,184,75,.16);color:#f5b84b}
 .model-badge.local{background:rgba(55,214,122,.14);color:#37d67a}
 /* Buttons & inputs */
-.btn{background:var(--accent);border:0;color:#fff;padding:8px 16px;border-radius:8px;font-size:0.929rem;cursor:pointer;font-weight:600}
-.btn:hover{filter:brightness(1.08)}
-.btn.ghost{background:var(--panel2);border:1px solid var(--line);color:var(--txt);font-weight:500}
+.btn{background:linear-gradient(180deg,var(--accent),#4d78e8);border:0;color:#fff;padding:8px 16px;border-radius:8px;font-size:0.929rem;cursor:pointer;font-weight:600;box-shadow:0 1px 2px rgba(2,6,18,.4),inset 0 1px 0 rgba(255,255,255,.14);transition:filter .12s,transform .05s}
+.btn:hover{filter:brightness(1.07)}
+.btn:active{transform:translateY(1px)}
+.btn.ghost{background:var(--panel2);border:1px solid var(--line);color:var(--txt);font-weight:500;box-shadow:none}
 .btn.sm{padding:5px 10px;font-size:0.857rem;margin-left:6px}
 .btn:disabled{opacity:.5;cursor:not-allowed}
-input,select,textarea{background:var(--code);border:1px solid var(--line);color:var(--txt);border-radius:8px;padding:8px 10px;font-size:0.929rem;width:100%}
+input,select,textarea{background:var(--code);border:1px solid var(--line);color:var(--txt);border-radius:8px;padding:8px 10px;font-size:0.929rem;width:100%;transition:border-color .12s,box-shadow .12s}
+input:focus,select:focus,textarea:focus{border-color:var(--accent);box-shadow:var(--ring);outline:none}
+input::placeholder,textarea::placeholder{color:#5b6b8a;opacity:1}
 textarea{resize:vertical;font-family:inherit}
 .field{margin-bottom:12px}
 .field label{display:block;color:var(--muted);font-size:0.786rem;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px}
@@ -1196,7 +1206,7 @@ textarea{resize:vertical;font-family:inherit}
 .chatbox{display:flex;flex-direction:column;gap:12px;height:58vh;min-height:440px;max-height:72vh;overflow-y:auto;padding:6px 4px 14px;scroll-behavior:smooth}
 .msg{display:flex;flex-direction:column;max-width:78%;padding:10px 14px 9px;border-radius:14px;font-size:0.929rem;white-space:pre-wrap;word-break:break-word;animation:msgIn .18s ease}
 @keyframes msgIn{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
-.msg.me{align-self:flex-end;background:linear-gradient(135deg,var(--accent),#5f7dff);color:#fff;border-bottom-right-radius:4px;box-shadow:0 2px 8px rgba(91,140,255,.25)}
+.msg.me{align-self:flex-end;background:linear-gradient(135deg,var(--accent),#5f7dff);color:#fff;border-bottom-right-radius:4px;box-shadow:0 2px 10px rgba(91,140,255,.3)}
 .msg.bot{align-self:flex-start;background:var(--panel2);border:1px solid var(--line);border-bottom-left-radius:4px;box-shadow:0 2px 8px rgba(0,0,0,.18)}
 .msg-top{display:flex;align-items:center;gap:8px;margin-bottom:5px}
 .msg .who{font-size:0.714rem;font-weight:700;letter-spacing:.6px;text-transform:uppercase;opacity:.85}
@@ -1233,9 +1243,9 @@ textarea{resize:vertical;font-family:inherit}
 .empty{color:var(--muted);text-align:center;padding:24px;font-size:0.929rem}
 .termbox{background:#0a0e16;border:1px solid #1f2937;border-radius:8px;padding:10px 12px;font:12px/1.5 ui-monospace,Menlo,Consolas,monospace;color:#c9d4e6;height:420px;overflow:auto;white-space:pre-wrap;word-break:break-all}
 .term-line{min-height:1.5em}.term-line.cmd{color:#7dd3fc}.term-line.err{color:#fca5a5}.term-line.out{color:#d1d5db}.term-line.muted{color:#6b7280}
-::-webkit-scrollbar{width:10px;height:10px}::-webkit-scrollbar-thumb{background:#263048;border-radius:6px}
+::-webkit-scrollbar{width:10px;height:10px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:#2b3a5c;border-radius:6px;border:2px solid transparent;background-clip:content-box}::-webkit-scrollbar-thumb:hover{background-color:#3a4c74}
 /* Light theme */
-body.light{--bg:#f2f5fa;--panel:#ffffff;--panel2:#eef2f8;--line:#d8dfeb;--txt:#1c2436;--muted:#5b6b85;--accent:#3b6df0;--accent2:#0e7490;--code:#f7f9fd}
+body.light{--bg:#eef2f9;--panel:#ffffff;--panel2:#f1f5fb;--panel3:#e6ecf6;--line:#d4dded;--txt:#17202f;--muted:#5a6b86;--accent:#2f66e0;--accent2:#0d7b9e;--ok:#0f9d5f;--warn:#b37a12;--bad:#d63a52;--code:#f7f9fd;--accent-ink:#ffffff;--soft-shadow:0 1px 2px rgba(20,40,90,.08)}
 body.light .termbox,body.light .msg.bot{background:#f7f9fd;border-color:#d8dfeb;color:#1c2436}
 body.light pre,body.light textarea,body.light input,body.light select{color:#1c2436}
 /* Responsive sidebar */
@@ -1267,6 +1277,7 @@ body.light pre,body.light textarea,body.light input,body.light select{color:#1c2
       <button data-v="memory"><span class="ic">◍</span>Memory</button>
       <button data-v="tools"><span class="ic">⊞</span>Tools</button>
       <button data-v="terminal"><span class="ic">▸</span>Terminal</button>
+      <button data-v="comms"><span class="ic">✆</span>Communications</button>
       <button data-v="system"><span class="ic">◎</span>System</button>
       <button data-v="settings"><span class="ic">⚙</span>Settings</button>
     </nav>
@@ -1311,7 +1322,7 @@ body.light pre,body.light textarea,body.light input,body.light select{color:#1c2
         <button class="btn ghost sm" id="chat-dl" title="Download the conversation as text">↓ Download</button>
         <button class="btn ghost sm" id="chat-clear" title="Clear the conversation" style="margin-left:8px">✕ Clear</button>
       </div><div class="bd">
-        <div class="chatbox" id="chatbox"><div class="msg bot"><div class="msg-top"><span class="who">OpenClaw</span><span class="ts" id="welcome-ts"></span></div><div class="msg-body">Connected. Ask me anything — I'll route through the configured worker model.</div><div class="msg-foot"><button class="msg-rev" title="Reverse this message">↔ reverse</button></div></div></div>
+        <div class="chatbox" id="chatbox"><div class="msg bot"><div class="msg-top"><span class="who">OpenClaw</span><span class="ts" id="welcome-ts"></span></div><div class="msg-body" id="welcome-body">Checking model connection…</div><div class="msg-foot"><button class="msg-rev" title="Reverse this message">↔ reverse</button></div></div></div>
         <div class="composer">
           <div class="chat-ctrl">
             <select id="chat-mode">
@@ -1434,6 +1445,16 @@ body.light pre,body.light textarea,body.light input,body.light select{color:#1c2
       </div>
     </section>
 
+    <!-- COMMUNICATIONS -->
+    <section class="view" id="view-comms">
+      <div class="cards" id="comms-cards"></div>
+      <div class="statusline" style="margin:-10px 0 14px" id="comms-status"></div>
+      <div id="comms-connectors"></div>
+      <div class="panel"><div class="hd">Message log <span class="statusline" style="margin-left:8px">last 150 across connectors</span>
+        <button class="btn ghost" id="comms-clear" style="margin-left:auto">Clear log</button>
+      </div><div class="bd" id="comms-log"><div class="empty">no traffic yet</div></div></div>
+    </section>
+
     <!-- SYSTEM -->
     <section class="view" id="view-system">
       <div class="cards" id="sys-cards"></div>
@@ -1538,14 +1559,15 @@ async function api(path,opts){let r;try{r=await fetch(path,opts);}catch(e){throw
 const post=(path,body)=>api(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
 
 /* navigation */
-const TITLES={overview:'Overview',chat:'Chat',agent:'Agent Runner',memory:'Memory',tools:'Tools',terminal:'Terminal',system:'System',settings:'Settings'};
+const TITLES={overview:'Overview',chat:'Chat',agent:'Agent Runner',memory:'Memory',tools:'Tools',terminal:'Terminal',comms:'Communications',system:'System',settings:'Settings'};
 let cur='overview';
 function showView(v){document.querySelectorAll('.nav button').forEach(x=>x.classList.toggle('active',x.dataset.v===v));cur=v;
   document.querySelectorAll('.view').forEach(x=>x.classList.toggle('active',x.id==='view-'+v));
   $('#title').textContent=TITLES[v]||v;
   if(v==='memory')loadMemStats();if(v==='tools')loadTools();if(v==='system')loadSystem();if(v==='settings')loadSettings();if(v==='agent')loadAgent();
   if(v==='terminal'){loadTerminal();$('#term-input').focus();}
-  if(v==='chat'){loadTodos();$('#chat-input').focus();}
+  if(v==='chat'){loadTodos();refreshSystemCfg();$('#chat-input').focus();}
+  if(v==='comms'){loadComms();}
   const side=$('.side');if(side)side.classList.remove('open');}
 document.querySelectorAll('.nav button').forEach(b=>b.addEventListener('click',()=>showView(b.dataset.v)));
 
@@ -1555,7 +1577,7 @@ function toggleTheme(){const t=document.body.classList.contains('light')?'dark':
 function initTheme(){let t='dark';try{t=localStorage.getItem('oc-theme')||'dark'}catch(e){}applyTheme(t);}
 function applyFontSize(size){
   size=parseInt(size,10);if(!(size>=10&&size<=24))size=14;
-  document.body.style.setProperty('--fs',size+'px');
+  document.documentElement.style.setProperty('--fs',size+'px');
   const s=$('#set-font-size');if(s)s.value=size;
   const b=$('#font-size-val');if(b)b.textContent=size+'px';
   try{localStorage.setItem('oc-font-size',String(size))}catch(e){}
@@ -1647,7 +1669,7 @@ function wireCopy(scope){
 /* refresh current view */
 function refreshView(){
   if(cur==='overview')loadOverview();if(cur==='memory')loadMemStats();
-  if(cur==='tools')loadTools();if(cur==='system')loadSystem();if(cur==='settings')loadSettings();if(cur==='agent'){loadAgent();loadTask();}
+  if(cur==='tools')loadTools();if(cur==='system')loadSystem();if(cur==='settings')loadSettings();if(cur==='comms')loadComms();if(cur==='agent'){loadAgent();loadTask();}
   if(cur==='chat')loadTodos();
   toast('refreshed');
 }
@@ -1717,12 +1739,48 @@ async function loadModels(sel){
     const el=$(sel);if(!el)return;
     const j=await api('/api/system');const models=j.config.models||[];
     const worker=j.config.worker_model||'';
+    const keys=j.config.provider_keys||{};
+    const cat=j.config.catalog||[];
+    const known=new Set(models.map(m=>m.name));
+    const groups=cat.map(g=>{
+      const keyed=!!keys[g.provider];
+      const items=(g.models||[]).filter(n=>!known.has(n)).map(n=>
+        `<option value="${esc(n)}"${keyed?'':' disabled'}>${esc(n)}${keyed?'':' — needs '+esc(g.provider)+' key'}</option>`).join('');
+      return items?`<optgroup label="${esc(g.name)}${keyed?'':' (unavailable)'}">${items}</optgroup>`:'';
+    }).join('');
     const opts=models.map(m=>{
       const tag=m.role==='local_worker'?'local worker':(m.role||'model');
       return `<option value="${esc(m.name)}">${esc(m.name)} (${esc(tag)})${m.name===worker?' · default':''}</option>`;
     }).join('');
-    el.innerHTML='<option value="">default worker · '+esc(worker||'none')+'</option>'+opts;
+    el.innerHTML='<option value="">default worker · '+esc(worker||'none')+'</option>'+opts+(groups?'<option value="" disabled>──────────────</option>'+groups:'');
   }catch(e){}
+}
+/* connection state + chat welcome */
+let _sysReady=null;
+async function refreshSystemCfg(){
+  try{window._ocSys=await api('/api/system');applyWelcome();}
+  catch(e){window._ocSys=null;applyWelcome();}
+}
+function ocModelReady(){
+  const c=window._ocSys&&window._ocSys.config;
+  const w=c?c.worker_model:'';
+  const models=c?(c.models||[]):[];
+  return {ready:!!w&&models.some(m=>m.name===w),worker:w,models:models,keys:(c?c.provider_keys:{})||{},catalog:(c?c.catalog:[])||[]};
+}
+function applyWelcome(){
+  const wb=$('#welcome-body');if(!wb)return;
+  const st=ocModelReady();
+  if(st.ready){
+    wb.innerHTML=`Connected. Ask me anything — I'll route through the configured worker model <b>${esc(st.worker)}</b>.`;
+  }else{
+    const keys=st.keys;const have=[];
+    if(keys.openai)have.push('OpenAI');if(keys.anthropic)have.push('Anthropic');if(keys.deepseek)have.push('DeepSeek');
+    const msg=have.length
+      ?('Keys are set for '+have.join(', ')+', but no model is active yet — check your local server / config in Settings.')
+      :'No working API key or local model is configured, so I can'+String.fromCharCode(39)+'t answer yet. Open <b>Settings</b> and add an OpenAI, Anthropic, DeepSeek or local model.';
+    wb.innerHTML=`<span style="color:var(--warn);font-weight:700">Not connected to an AI model.</span> ${msg} <button class="btn ghost sm" id="welcome-go-settings">Go to Settings</button>`;
+    const b=$('#welcome-go-settings');if(b)b.addEventListener('click',()=>showView('settings'));
+  }
 }
 async function sendChat(){
   const input=$('#chat-input');const text=input.value.trim();if(!text)return;
@@ -1755,7 +1813,8 @@ function chatHistory(){
     const body=m.querySelector('.msg-body');
     const txt=(body?body.innerText:'').trim();
     if(!txt)return;
-    if(txt.indexOf('Connected.')===0||txt.indexOf('Chat cleared.')===0)return;
+    if(m.querySelector('#welcome-body'))return;
+    if(txt.indexOf('Chat cleared.')===0)return;
     if(/^thinking…/i.test(txt))return;
     const role=m.classList.contains('me')?'user':'assistant';
     arr.push({role,content:txt});
@@ -1789,7 +1848,8 @@ function reverseMsg(btn){
   const th=box.querySelector('#thinking');if(th)th.remove();
   // Keep the welcome message if everything was removed.
   if(!box.querySelector('.msg')){
-    box.insertAdjacentHTML('beforeend','<div class="msg bot"><div class="msg-top"><span class="who">OpenClaw</span><span class="ts">'+chatTs()+'</span></div><div class="msg-body">Connected. Ask me anything — I will route through the configured worker model.</div><div class="msg-foot"><button class="msg-rev" title="Reverse this message">↔ reverse</button></div></div>');
+    box.insertAdjacentHTML('beforeend','<div class="msg bot"><div class="msg-top"><span class="who">OpenClaw</span><span class="ts">'+chatTs()+'</span></div><div class="msg-body" id="welcome-body"></div><div class="msg-foot"><button class="msg-rev" title="Reverse this message">↔ reverse</button></div></div>');
+    applyWelcome();
   }
   box.scrollTop=box.scrollHeight;
   chatStatus('↔ rolled back to this point');
@@ -2127,6 +2187,112 @@ $('#term-input').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDef
 $('#term-clear').addEventListener('click',()=>{$('#term-out').innerHTML='';$('#term-input').focus();});
 $('#err-clear').addEventListener('click',clearErrors);
 
+/* communications */
+let COMMS={connectors:[],log:[]};
+const COMMS_EL=()=>document.querySelector('#comms-connectors');
+async function saveCommsField(key,val,btn){
+  if(btn)btn.disabled=true;
+  try{
+    const j=await post('/api/comms/config',{field:{key:key,value:val}});
+    toast('Saved '+key);loadComms();
+  }catch(e){toast(e.message,true);}
+  finally{if(btn)btn.disabled=false;}
+}
+function commPill(c){
+  if(c.live)return '<span class="badge on">live</span>';
+  if(c.configured)return '<span class="badge">configured</span>';
+  return '<span class="badge">off</span>';
+}
+function commFieldHtml(f,c){
+  const secret=!!f.secret;
+  const ph=(secret&&c.configured)?'•••••••• (saved — leave blank to keep)':'';
+  const val=(!secret&&f.value)?esc(f.value):'';
+  return `<div class="field" style="margin-top:10px"><label>${esc(f.label)}</label>
+    <div class="row" style="align-items:center">
+      <input type="${secret?'password':'text'}" class="comms-field" data-key="${esc(f.key)}" data-secret="${secret?'1':'0'}" placeholder="${ph}" value="${val}" autocomplete="off" spellcheck="false" style="flex:3">
+      <button class="btn ghost" data-save="${esc(c.id)}" style="flex:0">Save</button>
+    </div></div>`;
+}
+function commCardHtml(c){
+  const fields=(c.fields||[]).map(f=>commFieldHtml(f,c)).join('');
+  const tg=c.id==='telegram';
+  return `<div class="panel"><div class="hd">${c.icon} ${esc(c.name)} ${commPill(c)} <span class="statusline" style="margin-left:6px;color:var(--muted)">${esc(c.kind)}</span></div><div class="bd">
+    <div class="sub" style="color:var(--muted)">${esc(c.detail||'')}</div>
+    ${fields}
+    <div class="row" style="gap:8px;align-items:center;margin-top:8px">
+      <button class="btn ghost sm" data-test="${esc(c.id)}">Test connection</button>
+      ${tg?`<label style="display:flex;align-items:center;gap:6px;margin-left:10px;font-size:0.857rem;color:var(--muted);cursor:pointer"><input type="checkbox" id="comms-tg-enabled" ${c.enabled?'checked':''} style="width:auto"> enable two-way bot</label>`:''}
+    </div>
+    ${tg?`<div class="row" style="margin-top:12px;align-items:flex-end">
+        <div class="field" style="flex:3;margin:0"><label>Send a message from your chat (outbound test)</label>
+          <textarea id="comms-tg-text" rows="2" placeholder="Message OpenClaw will post to your allowed Telegram chat…"></textarea></div>
+        <button class="btn" id="comms-tg-send" style="flex:0">Send</button>
+      </div>`:''}
+  </div></div>`;
+}
+function renderCommsLog(){
+  const el=$('#comms-log');if(!el)return;
+  const rows=COMMS.log||[];
+  el.innerHTML=rows.map(m=>{
+    const d=new Date(m.time*1000);
+    const arrow=m.direction==='in'?'↓ in':'↑ out';
+    return `<div class="ev"><span class="t">${d.toLocaleString()}</span> <span class="k">${esc(m.channel)} ${arrow}</span><div class="d">${esc(m.text||'')}</div></div>`;
+  }).join('')||'<div class="empty">no traffic yet</div>';
+}
+async function loadComms(){
+  try{COMMS=await api('/api/comms');}catch(e){toast('Could not load communications: '+e.message,true);return;}
+  const live=COMMS.connectors.filter(c=>c.live).length;
+  const cards=$('#comms-cards');
+  cards.innerHTML=`
+    <div class="card"><div class="label">Connectors</div><div class="val">${COMMS.connectors.length}</div><div class="sub">in this hub</div></div>
+    <div class="card"><div class="label">Live now</div><div class="val">${live}</div><div class="sub">active channels</div></div>
+    <div class="card"><div class="label">Daemon</div><div class="val small">${COMMS.running?'running':'off'}</div><div class="sub">messaging loop</div></div>`;
+  $('#comms-status').textContent=COMMS.running
+    ?'Messaging daemon is running. For Telegram two-way, save your token, set the allowed IDs, then tick "enable two-way bot".'
+    :'Messaging daemon is not running — start it via the Control Center ("serve" or "monitor").';
+  const con=$('#comms-connectors');
+  con.innerHTML=COMMS.connectors.map(commCardHtml).join('');
+  renderCommsLog();
+  wireCollapse();
+}
+const COMMS_CONTAINER=$('#comms-connectors');
+if(COMMS_CONTAINER)COMMS_CONTAINER.addEventListener('click',async e=>{
+  const save=e.target.closest('[data-save]');
+  if(save){
+    const key=save.closest('.field').querySelector('.comms-field');
+    const value=(key?key.value:'').trim();
+    const isSecret=key?key.dataset.secret==='1':false;
+    if(isSecret&&!value){toast('Token already set — leave blank to keep it.');return;}
+    await saveCommsField(key.dataset.key,value,save);return;
+  }
+  const test=e.target.closest('[data-test]');
+  if(test){
+    const btn=test;const ch=btn.dataset.test;btn.disabled=true;btn.textContent='testing…';
+    try{const j=await post('/api/comms/test',{channel:ch});
+      if(j.ok)toast('Connected: '+(j.detail||'message sent'));
+      else toast('Test failed: '+(j.error||'unknown'),true);}
+    catch(err){toast(err.message,true);}
+    btn.disabled=false;btn.textContent='Test connection';return;
+  }
+  if(e.target.id==='comms-tg-send'){
+    const text=$('#comms-tg-text').value.trim();
+    if(!text){toast('Enter a message first',true);return;}
+    const b=e.target;b.disabled=true;
+    try{const j=await post('/api/comms/send',{channel:'telegram',text});
+      if(j.ok)toast('Sent to Telegram chat');else toast('Send failed: '+(j.error||'unknown'),true);}
+    catch(err){toast(err.message,true);}
+    b.disabled=false;return;
+  }
+});
+if(COMMS_CONTAINER)COMMS_CONTAINER.addEventListener('change',async e=>{
+  if(e.target.id==='comms-tg-enabled'){
+    await saveCommsField('TELEGRAM_ENABLED',e.target.checked?'1':'0');
+  }
+});
+$('#comms-clear').addEventListener('click',async()=>{
+  try{await post('/api/comms/clear',{});toast('Message log cleared');loadComms();}catch(e){toast(e.message,true);}
+});
+
 /* heartbeat + wiring */
 async function heartbeat(){
   try{const s=await api('/api/system');$('#hd-status').textContent='online · '+s.system.python;$('#hd-dot').className='dot ok';}
@@ -2183,9 +2349,11 @@ $('#sys-backup').addEventListener('click',async()=>{
   const _wt=$('#welcome-ts');if(_wt)_wt.textContent=chatTs();
   wireCollapse();
   loadOverview();loadModels('#chat-model');loadModels('#agent-model');loadMemStats();loadMem('');loadTodos();
+  refreshSystemCfg();
   heartbeat();setInterval(heartbeat,5000);
   setInterval(()=>{if(cur==='overview')loadOverview()},10000);
   loadAgent();setInterval(()=>{if(cur==='agent')loadAgent()},3000);
+  setInterval(()=>{if(cur==='comms'){const a=document.activeElement;const c=$('#comms-connectors');if(!(a&&c&&c.contains(a)))loadComms();}},5000);
 })();
 </script>
 </body></html>'''
@@ -2235,8 +2403,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send(200,json.dumps(todo_list(include_done=True)))
             elif path=="/api/settings":
                 self._send(200,json.dumps(settings_status()))
+            elif path=="/api/comms":
+                self._send(200,json.dumps(comms_connector_status()))
             elif path=="/api/system":
-                self._send(200,json.dumps({"system":safe_local_tool("system_info"),"config":{"openclaw_home":str(ROOT),"worker_model":worker_model_name(),"supervisor_model":SUPERVISOR_MODEL_NAME,"terminal_policy":os.getenv("LOCAL_TERMINAL_POLICY","worker"),"models":[{"name":m["name"],"provider":m.get("provider"),"role":m.get("role"),"vision":m.get("vision",False),"tool_calls":m.get("tool_calls",False),"context_window":int(m.get("context_window",32768))} for m in MODELS]}}))
+                self._send(200,json.dumps({"system":safe_local_tool("system_info"),"config":{"openclaw_home":str(ROOT),"worker_model":worker_model_name(),"supervisor_model":SUPERVISOR_MODEL_NAME,"terminal_policy":os.getenv("LOCAL_TERMINAL_POLICY","worker"),"models":[{"name":m["name"],"provider":m.get("provider"),"role":m.get("role"),"vision":m.get("vision",False),"tool_calls":m.get("tool_calls",False),"context_window":int(m.get("context_window",32768))} for m in MODELS],"provider_keys":{"openai":provider_keyed("openai"),"anthropic":provider_keyed("anthropic"),"deepseek":provider_keyed("deepseek")},"catalog":MODEL_CATALOG}}))
             elif path=="/favicon.ico":
                 self._send(404,"")
             else:
@@ -2260,6 +2430,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 model=body.get("model")
                 mode=str(body.get("mode","auto")).lower()
                 history=body.get("history") if isinstance(body.get("history"),list) else None
+                if model:
+                    try: register_requested_model(model)
+                    except Exception as e:
+                        self._send(400,json.dumps({"ok":False,"error":str(e)})); return
                 sources=[]
                 # Detect web intent in this prompt OR a continuation of a prior
                 # web query (e.g. "has todo tu" after "buscame vuelos...").
@@ -2304,6 +2478,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "provider":result.get("_provider") if isinstance(result,dict) else None,
                     "role":result.get("_role") if isinstance(result,dict) else None}))
             elif path=="/api/agent":
+                if body.get("model"):
+                    try: register_requested_model(body.get("model"))
+                    except Exception as e:
+                        self._send(400,json.dumps({"ok":False,"error":str(e)})); return
                 result=general_agent(body.get("goal",""),body.get("conversation","agent"),body.get("model"),int(body.get("steps",4)))
                 self._send(200,json.dumps({"ok":True,"answer":result.get("answer",""),"task_id":result.get("task",{}).get("id"),"decision":result.get("task",{}).get("decision"),"status":result.get("task",{}).get("status")}))
             elif path=="/api/agent/queue":
@@ -2343,6 +2521,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     self._send(400,json.dumps({"ok":False,"error":str(e)}))
             elif path=="/api/settings":
                 self._send(200,json.dumps(apply_settings(body)))
+            elif path=="/api/comms/config":
+                self._send(200,json.dumps(comms_set_config(body.get("field") or body)))
+            elif path=="/api/comms/send":
+                r=_comms_send(body.get("channel",""),body.get("text",""))
+                self._send(200,json.dumps(r))
+            elif path=="/api/comms/test":
+                self._send(200,json.dumps(_comms_send_test(body.get("channel",""))))
+            elif path=="/api/comms/clear":
+                self._send(200,json.dumps({"ok":comms_clear_log()}))
             elif path=="/api/tool":
                 self._send(200,json.dumps(dispatch_tool(body.get("name",""),body.get("args",{}))))
             elif path=="/api/todo/add":
@@ -2368,6 +2555,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 def dashboard(port=8765):
     server=ThreadingHTTPServer(("127.0.0.1",port),DashboardHandler)
+    try: ensure_comms()
+    except Exception: pass
     url=f"http://127.0.0.1:{port}/"; print("OpenClaw monitor:",url)
     try:
         if sys.platform == "darwin": subprocess.Popen(["open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -2904,7 +3093,7 @@ def _fix_db():
         DB.close()
         if DB_PATH.exists(): DB_PATH.unlink()
         DB_PATH.parent.mkdir(parents=True,exist_ok=True)
-        globals()["DB"]=sqlite3.connect(DB_PATH,timeout=30)
+        globals()["DB"]=sqlite3.connect(DB_PATH,timeout=30,check_same_thread=False)
         DB.execute("PRAGMA journal_mode=WAL"); DB.execute("PRAGMA busy_timeout=30000")
         DB.execute("""CREATE TABLE IF NOT EXISTS memories(
  id TEXT PRIMARY KEY, text TEXT NOT NULL, category TEXT NOT NULL,
@@ -3051,37 +3240,71 @@ def detect_existing_install():
     return found
 
 def preinstall_cleanup():
-    found=detect_existing_install()
-    if not found:
-        return True
-    print("Existing OpenClaw installation detected:")
-    for name,path in found:
-        print(f"  - {name}: {path}")
-    if not sys.stdin.isatty():
-        print("No terminal available; keeping existing installation.")
-        return True
-    try:
-        ans=input("Delete it before proceeding? [y/N] ").strip().lower()
-    except (EOFError,KeyboardInterrupt):
-        return True
-    if ans not in ("y","yes"):
-        print("Keeping existing installation.")
-        return True
+    # On install, make sure ALL previous OpenClaw files and MemPalace memory are
+    # cleared so this is a clean start. Items are moved to the macOS Trash (so
+    # they are recoverable), never the currently-running program folder.
     import shutil
+    src=Path(os.path.abspath(__file__)).resolve()
+    src_res=src.parent.resolve()
     trash=Path.home()/".Trash" if sys.platform=="darwin" else ROOT.parent/".openclaw-trash"
-    trash.mkdir(parents=True,exist_ok=True)
+    try: trash.mkdir(parents=True,exist_ok=True)
+    except Exception: trash=None
     stamp=time.strftime("%Y%m%d-%H%M%S")
-    for i,(name,path) in enumerate(found):
-        target=Path(path)
-        dest=trash/(target.name+"-"+stamp+("-"+str(i) if i else ""))
+    removed=[]; failed=[]
+
+    def wipe(target,label):
+        if not target.exists(): return
+        try: tp=target.resolve()
+        except Exception: tp=target.absolute()
+        # Never delete the running program/source or anything above it.
+        if tp==src_res or tp==src or src_res in tp.parents or tp in src_res.parents:
+            failed.append((label,"refusing to delete the running OpenClaw folder"))
+            return
+        if trash is None:
+            try:
+                if target.is_dir(): shutil.rmtree(str(target))
+                else: target.unlink()
+                removed.append(label)
+            except Exception as e: failed.append((label,str(e)))
+            return
+        dest=trash/(target.name+"-"+stamp); n=1
+        while dest.exists():
+            dest=trash/(target.name+"-"+stamp+"-"+str(n)); n+=1
         try:
-            if target.is_dir() and not target.is_symlink():
-                shutil.move(str(target),str(dest))
-            else:
-                shutil.move(str(target),str(dest))
-            print("Moved to trash:",path,"->",dest)
-        except OSError as e:
-            print("Could not move to trash",path,":",e)
+            shutil.move(str(target),str(dest)); removed.append(label+"  ->  "+dest.name)
+        except OSError:
+            try:
+                if target.is_dir(): shutil.rmtree(str(target))
+                else: target.unlink()
+                removed.append(label)
+            except Exception as e: failed.append((label,str(e)))
+
+    # Close the database before removing its folder so nothing is left half-written.
+    try: DB.close()
+    except Exception: pass
+    # 1) Data home + MemPalace memory (everything under OPENCLAW_HOME).
+    if ROOT.exists(): wipe(ROOT,"openclaw data + memory ("+str(ROOT)+")")
+    # 2) Legacy ~/.openclaw install.
+    legacy=Path.home()/".openclaw"
+    if legacy.exists(): wipe(legacy,"legacy ~/.openclaw")
+    # 3) Installed openclaw pip package.
+    pip=shutil.which("pip3") or shutil.which("pip")
+    if pip:
+        try:
+            r=subprocess.run([pip,"uninstall","-y","openclaw"],capture_output=True,text=True,timeout=120)
+            if r.returncode==0: removed.append("pip openclaw package")
+        except Exception: pass
+    # 4) Old dated all-in-one Desktop folders.
+    desktop=Path.home()/"Desktop"
+    if desktop.is_dir():
+        for cand in sorted(desktop.iterdir()):
+            if cand.is_dir() and re.match(r"^OpenClaw\(.*\)$",cand.name):
+                wipe(cand,"old Desktop folder "+cand.name)
+    for label in removed: print("Deleted:",label)
+    for label,err in failed: print("Could not delete",label,":",err)
+    # Recreate an empty home so the fresh install has somewhere to write.
+    try: ROOT.mkdir(parents=True,exist_ok=True)
+    except Exception: pass
     return True
 
 def health_report():
@@ -3219,14 +3442,114 @@ def web_terminal(command, cwd=None):
         log_event("web_terminal_timeout",command=command,cwd=cwd)
         return {"ok":False,"command":command,"cwd":cwd,"stdout":(e.stdout or "")[-30000:] if isinstance(e.stdout,str) else "","stderr":(e.stderr or "")[-10000:] if isinstance(e.stderr,str) else "","returncode":None,"timed_out":True,"policy":policy}
 
+def _boot_time_stdlib():
+    """Whole-machine boot time (epoch seconds) without psutil."""
+    try:
+        if sys.platform.startswith("linux"):
+            with open("/proc/uptime") as f: up=float(f.read().split()[0])
+            return int(time.time()-up)
+        if sys.platform.startswith("darwin"):
+            out=subprocess.run(["sysctl","-n","kern.boottime"],capture_output=True,text=True,timeout=5).stdout
+            import re as _re
+            m=_re.search(r"sec\s*=\s*(\d+)",out)
+            if m: return int(m.group(1))
+        if sys.platform.startswith("win"):
+            import ctypes
+            class T(ctypes.Structure): _fields_=[("dwLowDateTime",ctypes.c_uint),("dwHighDateTime",ctypes.c_uint)]
+            ctypes.windll.kernel32.GetTickCount64
+            return int((time.time()*1000-ctypes.windll.kernel32.GetTickCount64())/1000)
+    except Exception:
+        pass
+    return None
+
+def _meminfo_stdlib():
+    """RAM used/total in bytes + percent without psutil (best effort)."""
+    try:
+        if sys.platform.startswith("linux"):
+            vals={}
+            for line in open("/proc/meminfo"):
+                k,v=line.split(":",1); vals[k]=int(v.strip().split()[0])*1024
+            total=vals.get("MemTotal"); avail=vals.get("MemAvailable",vals.get("MemFree",0))
+            if total: return total,(total-avail),round((total-avail)/total*100,1)
+        if sys.platform.startswith("darwin"):
+            total=int(subprocess.run(["sysctl","-n","hw.memsize"],capture_output=True,text=True,timeout=5).stdout.strip() or 0)
+            out=subprocess.run(["vm_stat"],capture_output=True,text=True,timeout=5).stdout
+            import re as _re
+            page=1; vals={}
+            for line in out.splitlines():
+                line=line.strip()
+                if "page size of" in line:
+                    m=_re.search(r"page size of\s+(\d+)\s+bytes",line)
+                    if m: page=int(m.group(1))
+                    continue
+                if line.startswith("Mach Virtual") or not line: continue
+                if ":" in line:
+                    k,v=line.split(":",1); vals[k.strip()]=int(v.strip().rstrip("."))
+            pages_used=vals.get("Pages active",0)+vals.get("Pages wired down",0)+vals.get("Pages occupied by compressor",0)
+            used=pages_used*page
+            used=max(0,min(used,total))
+            if total: return total,used,round(used/total*100,1)
+        if sys.platform.startswith("win"):
+            import ctypes
+            class MS(ctypes.Structure):
+                _fields_=[("dwLength",ctypes.c_uint32),("dwMemoryLoad",ctypes.c_uint32),
+                          ("ullTotalPhys",ctypes.c_uint64),("ullAvailPhys",ctypes.c_uint64),
+                          ("ullTotalPageFile",ctypes.c_uint64),("ullAvailPageFile",ctypes.c_uint64),
+                          ("ullTotalVirtual",ctypes.c_uint64),("ullAvailVirtual",ctypes.c_uint64),
+                          ("ullAvailExtendedVirtual",ctypes.c_uint64)]
+            ms=MS(); ms.dwLength=ctypes.sizeof(MS)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
+                total=ms.ullTotalPhys; avail=ms.ullAvailPhys
+                return total,(total-avail),ms.dwMemoryLoad
+    except Exception:
+        pass
+    return None,None,None
+
+def _cpu_stdlib():
+    """Approximate whole-machine CPU% without psutil (best effort)."""
+    try:
+        if sys.platform.startswith("darwin") or sys.platform.startswith("linux"):
+            out=subprocess.run(["ps","-A","-o","%cpu="],capture_output=True,text=True,timeout=10).stdout
+            vals=[float(x) for x in out.split() if x.strip().replace(".","").isdigit()]
+            if not vals: return None
+            try:
+                n=os.cpu_count() or 1
+            except Exception:
+                n=1
+            return max(0.0,min(100.0,round(sum(vals)/n,1)))
+        if sys.platform.startswith("win"):
+            out=subprocess.run(["wmic","cpu","get","loadpercentage"],capture_output=True,text=True,timeout=10).stdout
+            for line in out.splitlines():
+                line=line.strip()
+                if line.isdigit(): return float(line)
+    except Exception:
+        pass
+    return None
+
 def system_resources():
     info={"cpu_percent":None,"mem_used_mb":None,"mem_total_mb":None,"mem_percent":None,"disk_used_gb":None,"disk_total_gb":None,"disk_percent":None,"uptime_seconds":None}
     try:
         import psutil
         vm=psutil.virtual_memory(); du=psutil.disk_usage(str(ROOT))
-        info.update({"cpu_percent":round(psutil.cpu_percent(interval=0.5),1),"mem_used_mb":round(vm.used/1048576),"mem_total_mb":round(vm.total/1048576),"mem_percent":round(vm.percent,1),"disk_used_gb":round(du.used/1073741824,1),"disk_total_gb":round(du.total/1073741824,1),"disk_percent":round(du.percent,1),"uptime_seconds":int(time.time()-psutil.boot_time())})
+        info.update({"cpu_percent":round(psutil.cpu_percent(interval=0.4),1),"mem_used_mb":round(vm.used/1048576),"mem_total_mb":round(vm.total/1048576),"mem_percent":round(vm.percent,1),"disk_used_gb":round(du.used/1073741824,1),"disk_total_gb":round(du.total/1073741824,1),"disk_percent":round(du.percent,1),"uptime_seconds":int(time.time()-psutil.boot_time())})
+        return info
     except Exception:
         pass
+    try:
+        total,used,pct=_meminfo_stdlib()
+        if total:
+            info["mem_total_mb"]=round(total/1048576); info["mem_used_mb"]=round(used/1048576); info["mem_percent"]=pct
+    except Exception:
+        pass
+    try:
+        d=os.statvfs(str(ROOT))
+        total_bytes=d.f_frsize*d.f_blocks; free=d.f_frsize*d.f_bavail
+        info["disk_total_gb"]=round(total_bytes/1073741824,1); info["disk_used_gb"]=round((total_bytes-free)/1073741824,1); info["disk_percent"]=round((1-free/max(1,total_bytes))*100,1)
+    except Exception:
+        pass
+    info["cpu_percent"]=_cpu_stdlib()
+    bt=_boot_time_stdlib()
+    if bt: info["uptime_seconds"]=int(time.time()-bt)
     return info
 
 def setup_menu():
@@ -3331,6 +3654,389 @@ def make_backup():
             if fp.exists(): t.add(fp,arcname=fn)
     log_event("backup_created",path=str(out)); return {"ok":True,"path":str(out),"bytes":out.stat().st_size}
 
+def desktop_all_in_one():
+    """On install, gather every OpenClaw folder and file into one dated folder
+    on the Desktop named OpenClaw(YYYYMMDD.HHMMSS). It contains (1) the runnable
+    program files, (2) a full copy of the source/repo, and (3) the data home
+    (everything under OPENCLAW_HOME), so the result is fully self-contained."""
+    import shutil
+    stamp=time.strftime("%Y%m%d.%H%M%S")
+    src=Path(os.path.abspath(__file__)).resolve().parent
+    desktop=Path.home()/"Desktop"
+    if not desktop.is_dir():
+        try: desktop.mkdir(parents=True,exist_ok=True)
+        except Exception as e: return {"error":"no Desktop folder: "+str(e)}
+    dest=desktop/("OpenClaw("+stamp+")")
+    dest.mkdir(parents=True,exist_ok=True)
+    added=[]; skipped=[]
+    # 1) Program files at the top level (script, launcher, README, app bundle).
+    for rel in sorted(os.listdir(str(src))):
+        if rel.startswith(".") or rel in {".git","__pycache__"}: continue
+        sp=src/rel; dp=dest/rel
+        try:
+            if sp.is_dir():
+                if dp.exists(): shutil.rmtree(dp,ignore_errors=True)
+                shutil.copytree(sp,dp)
+                added.append(rel+"/")
+            else:
+                shutil.copy2(sp,dp); added.append(rel)
+        except Exception as e:
+            skipped.append({"name":rel,"error":str(e)})
+    # 2) Full source/repo folder (including .git) as a nested subfolder.
+    repo_dest=dest/"openclaw-source"
+    if repo_dest.exists(): shutil.rmtree(repo_dest,ignore_errors=True)
+    try:
+        shutil.copytree(src,repo_dest)
+        added.append("openclaw-source/ (full source incl .git)")
+    except Exception as e:
+        skipped.append({"name":"openclaw-source","error":str(e)})
+    # 3) Data home (everything under OPENCLAW_HOME) as a nested subfolder.
+    data_dest=dest/"openclaw-data"
+    if ROOT.is_dir() and ROOT.resolve()!=dest.resolve():
+        if data_dest.exists(): shutil.rmtree(data_dest,ignore_errors=True)
+        try:
+            shutil.copytree(ROOT,data_dest)
+            added.append("openclaw-data/ (OPENCLAW_HOME contents)")
+        except Exception as e:
+            skipped.append({"name":"openclaw-data","error":str(e)})
+    elif ROOT.is_dir():
+        skipped.append({"name":"openclaw-data","error":"data home is the destination folder"})
+    else:
+        skipped.append({"name":"openclaw-data","error":"OPENCLAW_HOME does not exist"})
+    return {"folder":str(dest),"items":added,"skipped":skipped}
+
+def create_start_icon(bundle_folder):
+    """Put a double-clickable 'Start OpenClaw.command' on the Desktop that
+    launches the self-contained copy inside bundle_folder (its own data home)."""
+    import stat
+    bundle=Path(bundle_folder).expanduser().resolve()
+    icon=Path.home()/"Desktop"/"Start OpenClaw.command"
+    data=bundle/"openclaw-data"
+    script=bundle/"openclaw-one.sh"
+    try: data.mkdir(parents=True,exist_ok=True)
+    except Exception: pass
+    icon.write_text(
+        "#!/bin/bash\n"
+        "# OpenClaw launcher (generated by install)\n"
+        f'export OPENCLAW_HOME="{data}"\n'
+        f'cd "{bundle}"\n'
+        f'exec "{script}" repl\n',
+        encoding="utf-8")
+    try: os.chmod(str(icon),0o755)
+    except Exception: pass
+    return icon
+
+# ============================================================================
+# Communications / messaging connectors (Telegram two-way, Slack & Discord out)
+# Connector secrets + flags live in the env file (via save_env) so they persist
+# and load at startup through _load_env_file().  The comms daemon re-reads the
+# env each loop, so toggling a connector from the web UI takes effect without a
+# restart.  Only the Python stdlib (urllib/json/html) is used on purpose.
+# ============================================================================
+COMMS_FILE = ROOT / "comms.json"
+_comms_io_lock = threading.Lock()
+_comms_started = False
+_TG_ME_CACHE = {}
+
+def _comms_state():
+    with _comms_io_lock:
+        try:
+            if COMMS_FILE.exists():
+                st = json.loads(COMMS_FILE.read_text(encoding="utf-8"))
+                if isinstance(st, dict): return st
+        except Exception: pass
+        return {"offset": {}, "log": []}
+
+def _save_comms_state(st):
+    with _comms_io_lock:
+        try: COMMS_FILE.write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
+        except Exception as e: log_error("comms_state_save", e)
+
+def comms_log(channel, direction, text, meta=None):
+    st = _comms_state()
+    st.setdefault("log", []).append({"time": int(time.time()), "channel": channel,
+        "direction": direction, "text": (text or "")[:2000], "meta": meta or {}})
+    st["log"] = st["log"][-300:]
+    _save_comms_state(st)
+    return st["log"]
+
+def comms_clear_log():
+    st = _comms_state(); st["log"] = []; _save_comms_state(st); return True
+
+def _tg_url(token, method):
+    return "https://api.telegram.org/bot" + token.strip() + "/" + method
+
+def _tg_api(token, method, params, timeout=45):
+    req = urllib.request.Request(_tg_url(token, method), data=urllib.parse.urlencode(params).encode("utf-8"), method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+def _tg_allowed_ids():
+    out = []
+    for part in os.getenv("TELEGRAM_ALLOWED_IDS", "").split(","):
+        part = part.strip()
+        if part:
+            try: out.append(int(part))
+            except ValueError: pass
+    return out
+
+def _tg_send(chat_id, text):
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token: return False, "Telegram bot token not configured"
+    body = html.escape(text) if text else ""
+    body = "\n".join(line[:4080] for line in body.splitlines())
+    try:
+        resp = _tg_api(token, "sendMessage", {"chat_id": chat_id, "text": body, "parse_mode": "HTML"})
+        if resp.get("ok"): return True, "sent"
+        return False, "Telegram error: " + str(resp.get("description", resp))
+    except Exception as e:
+        return False, str(e)
+
+def _comms_send(channel, text):
+    """Send outbound text over a connector. Telegram posts to the first allowed
+    chat; Slack/Discord post to their configured webhook channels."""
+    channel = (channel or "").strip().lower(); text = (text or "").strip()
+    if not text: return {"ok": False, "error": "message is empty"}
+    if channel == "telegram":
+        ids = _tg_allowed_ids()
+        if not ids: return {"ok": False, "error": "no TELEGRAM_ALLOWED_IDS configured to send to"}
+        ok, msg = _tg_send(ids[0], text); comms_log("telegram", "out", text)
+        return {"ok": ok, "error": None if ok else msg}
+    if channel == "slack":
+        url = os.getenv("SLACK_WEBHOOK_URL", "").strip()
+        if not url: return {"ok": False, "error": "Slack webhook URL not configured"}
+        try:
+            req = urllib.request.Request(url, data=json.dumps({"text": text}).encode(), method="POST",
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=20) as r: r.read()
+            comms_log("slack", "out", text); return {"ok": True}
+        except Exception as e: return {"ok": False, "error": str(e)}
+    if channel == "discord":
+        url = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+        if not url: return {"ok": False, "error": "Discord webhook URL not configured"}
+        try:
+            req = urllib.request.Request(url, data=urllib.parse.urlencode({"content": text[:2000]}).encode(), method="POST",
+                                         headers={"Content-Type": "application/x-www-form-urlencoded"})
+            with urllib.request.urlopen(req, timeout=20) as r: r.read()
+            comms_log("discord", "out", text); return {"ok": True}
+        except Exception as e: return {"ok": False, "error": str(e)}
+    return {"ok": False, "error": "unknown connector: " + channel}
+
+def comms_notify_all(text):
+    """Fan a message out to every configured outbound connector."""
+    res = {}
+    for ch in ("telegram", "slack", "discord"):
+        r = _comms_send(ch, text)
+        if r.get("ok") or (ch == "telegram"): res[ch] = r.get("ok", False)
+    return res
+
+def _comms_send_test(channel):
+    channel = (channel or "").strip().lower()
+    if channel == "telegram":
+        token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+        if not token: return {"ok": False, "error": "no token"}
+        try:
+            resp = _tg_api(token, "getMe", {})
+            if not resp.get("ok"): return {"ok": False, "error": "Telegram error: " + str(resp.get("description", resp))}
+            me = (resp.get("result") or {})
+            _TG_ME_CACHE["username"] = me.get("username"); _TG_ME_CACHE["name"] = me.get("first_name")
+            return {"ok": True, "detail": "@" + str(me.get("username") or "?") + " (" + str(me.get("first_name") or "bot") + ")"}
+        except Exception as e: return {"ok": False, "error": str(e)}
+    return _comms_send(channel, "OpenClaw connector test — if you can read this, it works.")
+
+def _dispatch_remote(text, user_id, channel):
+    """Turn an inbound message into a reply. /agent queues background goals;
+    /mem searches memory; anything else is a normal chat turn."""
+    t = (text or "").strip()
+    low = t.lower()
+    if low in ("/start", "/help", "help", "hi", "hello"):
+        return {"text": "OpenClaw bot connected. I can:\n• chat with you\n• /agent <goal> — run a background task\n• /mem <query> — search memories\n• /status — connector + system status", "command": True}
+    if low == "/status":
+        try:
+            return {"text": "Worker: " + (worker_model_name() or "none configured") +
+                            "\nModels: " + str(len(MODELS)) +
+                            "\nMemories: " + str(health_mem_count()), "command": True}
+        except Exception as e:
+            return {"text": "status error: " + str(e), "command": True}
+    if low.startswith("/agent "):
+        goal = t[len("/agent "):].strip()
+        try:
+            item = agent_inbox_add(goal, "agent", 4)
+            return {"text": "Queued as task " + str(item["id"]) + " — I'll run it in the background and report when done.", "command": True}
+        except Exception as e:
+            return {"text": "Could not queue that goal: " + str(e), "command": True}
+    if low.startswith("/mem "):
+        q = t[len("/mem "):].strip()
+        try:
+            rows = mem_search(q, 5)
+            if not rows: return {"text": "No memories matched '" + q + "'.", "command": True}
+            return {"text": "Memories:\n" + "\n".join("• [" + r["category"] + "] " + r["text"][:300] for r in rows), "command": True}
+        except Exception as e:
+            return {"text": "memory search error: " + str(e), "command": True}
+    # Ordinary turn -> route through the normal chat pipeline (memory included).
+    conv = "telegram:" + str(user_id)
+    try:
+        res = chat(t, conversation=conv, use_memory=True)
+        ans = ""
+        if isinstance(res, dict):
+            try: ans = res["choices"][0]["message"]["content"]
+            except Exception: ans = res.get("answer", "")
+        return {"text": ans or "(empty reply)"}
+    except Exception as e:
+        log_error("telegram_chat", e)
+        return {"text": "Error processing your message: " + str(e)[:280]}
+
+def health_mem_count():
+    try: return mem_stats().get("total", 0)
+    except Exception: return 0
+
+def _telegram_poll_once():
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token: return
+    allowed = _tg_allowed_ids()
+    st = _comms_state(); offset = int(st.get("offset", {}).get("telegram", 0))
+    try:
+        resp = _tg_api(token, "getUpdates", {"timeout": 20, "offset": offset + 1,
+            "allowed_updates": ["message"]}, timeout=45)
+    except Exception as e:
+        log_error("telegram_poll", e); time.sleep(3); return
+    updates = resp.get("result", []) if isinstance(resp, dict) else []
+    for upd in updates:
+        upd_id = int(upd.get("update_id", 0))
+        msg = upd.get("message") or {}
+        chat = msg.get("chat") or {}
+        chat_id = chat.get("id"); text = msg.get("text") or ""
+        if chat_id is None: continue
+        # Acknowledge (advance offset) so we never replay, even if processing fails.
+        st = _comms_state(); st.setdefault("offset", {})["telegram"] = upd_id; _save_comms_state(st)
+        if not text.strip():
+            continue
+        user_id = chat_id
+        if chat.get("type") == "private" and allowed and chat_id not in allowed:
+            _tg_send(chat_id, "Sorry — this chat isn't in TELEGRAM_ALLOWED_IDS, so I can't answer here.")
+            continue
+        comms_log("telegram", "in", text, {"chat_id": chat_id})
+        out = _dispatch_remote(text, user_id, "telegram")
+        if out.get("text"):
+            _tg_send(chat_id, out["text"])
+
+def comms_daemon():
+    """Background loop: drives Telegram long-polling and re-reads config each pass."""
+    while True:
+        try:
+            if os.getenv("TELEGRAM_ENABLED", "0") == "1":
+                _telegram_poll_once()
+            else:
+                time.sleep(2)
+        except Exception as e:
+            log_error("comms_daemon", e); time.sleep(5)
+        time.sleep(1)
+
+def ensure_comms():
+    global _comms_started
+    if _comms_started: return
+    with _comms_io_lock:
+        if _comms_started: return
+        try:
+            threading.Thread(target=comms_daemon, daemon=True).start()
+            _comms_started = True
+        except Exception as e:
+            log_error("comms_start", e)
+
+def comms_connector_status():
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    tg_on = token and os.getenv("TELEGRAM_ENABLED", "0") == "1"
+    if tg_on and not _TG_ME_CACHE.get("username"):
+        try:
+            resp = _tg_api(token, "getMe", {}, timeout=15)
+            if resp.get("ok"):
+                me = resp.get("result") or {}
+                _TG_ME_CACHE["username"] = me.get("username"); _TG_ME_CACHE["name"] = me.get("first_name")
+        except Exception:
+            pass
+    connectors = [
+        {"id": "telegram", "icon": "✈", "name": "Telegram",
+         "kind": "Two-way chat (bot)", "live": bool(tg_on),
+         "configured": bool(token), "enabled": os.getenv("TELEGRAM_ENABLED", "0") == "1",
+         "detail": "Inbound messages answered by the agent." if bool(tg_on) else
+                   ("token set, disabled" if token else "no bot token set"),
+         "fields": [{"key": "TELEGRAM_BOT_TOKEN", "label": "Bot token", "secret": True, "value": ""},
+                    {"key": "TELEGRAM_ALLOWED_IDS", "label": "Allowed chat/user IDs (comma)", "secret": False,
+                     "value": os.getenv("TELEGRAM_ALLOWED_IDS", "")}]},
+        {"id": "slack", "icon": "◫", "name": "Slack", "kind": "Incoming webhook (outbound)",
+         "live": bool(os.getenv("SLACK_WEBHOOK_URL", "").strip()),
+         "configured": bool(os.getenv("SLACK_WEBHOOK_URL", "").strip()),
+         "enabled": bool(os.getenv("SLACK_WEBHOOK_URL", "").strip()),
+         "detail": "Posts to a Slack channel via webhook.",
+         "fields": [{"key": "SLACK_WEBHOOK_URL", "label": "Webhook URL", "secret": True, "value": ""}]},
+        {"id": "discord", "icon": "◆", "name": "Discord", "kind": "Webhook (outbound)",
+         "live": bool(os.getenv("DISCORD_WEBHOOK_URL", "").strip()),
+         "configured": bool(os.getenv("DISCORD_WEBHOOK_URL", "").strip()),
+         "enabled": bool(os.getenv("DISCORD_WEBHOOK_URL", "").strip()),
+         "detail": "Posts to a Discord channel via webhook.",
+         "fields": [{"key": "DISCORD_WEBHOOK_URL", "label": "Webhook URL", "secret": True, "value": ""}]},
+        {"id": "whatsapp", "icon": "☏", "name": "WhatsApp", "kind": "Outbound notify", "live": False, "configured": False,
+         "enabled": False, "detail": "Planned — same two-way pattern.", "fields": []},
+        {"id": "email", "icon": "✉", "name": "Email (SMTP)", "kind": "Outbound notify", "live": False, "configured": False,
+         "enabled": False, "detail": "Planned — same outbound pattern.", "fields": []},
+    ]
+    if _TG_ME_CACHE.get("username"):
+        connectors[0]["detail"] = "@" + str(_TG_ME_CACHE.get("username")) + " · two-way active"
+    return {"connectors": connectors,
+            "log": _comms_state().get("log", [])[-150:][::-1],
+            "running": _comms_started}
+
+def comms_set_config(field):
+    """Persist one connector env var from the UI (token/url/allowed ids/flag)."""
+    if not isinstance(field, dict): return {"ok": False, "error": "invalid config"}
+    key = str(field.get("key", "")).strip()
+    allow = {"TELEGRAM_BOT_TOKEN", "TELEGRAM_ALLOWED_IDS", "SLACK_WEBHOOK_URL", "DISCORD_WEBHOOK_URL"}
+    if key == "TELEGRAM_ENABLED":
+        val = "1" if field.get("value") in (True, 1, "1", "true", "on") else "0"
+        save_env(key, val); return {"ok": True, "changed": key}
+    if key not in allow: return {"ok": False, "error": "unknown field " + key}
+    val = str(field.get("value", "")).strip()
+    save_env(key, val)
+    return {"ok": True, "changed": key}
+
+# Model catalog: well-known models offered in the web model pickers. A catalog
+# model becomes usable at request time ONLY when its provider's API key is
+# configured (see register_requested_model). Provider keys are surfaced to the
+# UI via /api/system -> config.provider_keys so unavailable choices are disabled.
+MODEL_CATALOG = [
+    {"provider": "openai", "name": "OpenAI",
+     "models": ["gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-4.1", "gpt-4.1-mini",
+                "gpt-4.1-nano", "gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-4",
+                "o3", "o3-mini", "o1", "o1-mini", "chatgpt-4o-latest"]},
+    {"provider": "anthropic", "name": "Anthropic",
+     "models": ["claude-opus-4-1", "claude-opus-4", "claude-sonnet-4", "claude-sonnet-4-5",
+                "claude-3-7-sonnet-latest", "claude-3-5-sonnet-latest",
+                "claude-3-5-haiku-latest", "claude-3-haiku"]},
+    {"provider": "deepseek", "name": "DeepSeek",
+     "models": ["deepseek-chat", "deepseek-reasoner"]},
+]
+
+def provider_keyed(provider):
+    if provider == "openai": return _key_set("OPENAI_API_KEY")
+    if provider == "anthropic": return _key_set("ANTHROPIC_API_KEY")
+    if provider == "deepseek": return _key_set("DEEPSEEK_API_KEY")
+    return False
+
+def register_requested_model(name):
+    """Add a catalog model to MODELS for this run so the user can chat with it,
+    but only if its provider is actually configured with a key. Mirrors the
+    existing provider entry (same endpoint/key/role) with the requested name."""
+    if any(m.get("name") == name for m in MODELS): return
+    prov = next((g["provider"] for g in MODEL_CATALOG if name in g["models"]), None)
+    base = None
+    if prov:
+        base = next((m for m in MODELS if m.get("provider") == prov), None)
+    if not prov or not base or not base.get("key") or not base.get("url"):
+        raise RuntimeError("Model '" + name + "' is unavailable: no " +
+                           (prov or "matching") + " API key is configured. Add one in Settings.")
+    clone = dict(base); clone["name"] = name; clone.pop("_model", None)
+    MODELS.append(clone)
+
 def main():
     daily_learn()
     p=argparse.ArgumentParser(description="OpenClaw hybrid gateway with MemPalace")
@@ -3424,6 +4130,14 @@ def main():
         print_doctor(res)
         if not res["all_ok"]:
             print("\n[ warn ] Installation finished with issues (you can still start OpenClaw, but set a model later to use AI features).\n")
+        pkg=desktop_all_in_one()
+        if "error" in pkg:
+            print("[ warn ] Could not create Desktop all-in-one folder:",pkg["error"])
+        else:
+            print(f"[ done ] All-in-one folder created on Desktop: {pkg['folder']}")
+            if pkg.get("skipped"): print("[ warn ] Some files were skipped:",pkg["skipped"])
+            icon=create_start_icon(pkg["folder"])
+            print(f"[ done ] Start icon created on Desktop: {icon}")
         print("Starting OpenClaw services (web + background agent)...")
         try:
             started=run_all(os.getenv("OPENCLAW_WEB_PORT","8765"))
