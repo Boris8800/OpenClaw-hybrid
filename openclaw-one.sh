@@ -3072,13 +3072,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     result=chat(prompt,conv,body.get("system"),False,False,model,None,True,history)
                     answer=result.get("choices",[{}])[0].get("message",{}).get("content","")
                 elif not model or model==worker_model_name():
-                    try:
-                        result=general_agent(prompt,conv,None,int(body.get("steps",4)))
-                        answer=result.get("answer","")
-                    except Exception as e:
-                        log_error("chat_hybrid_fallback",e)
-                        result=chat(prompt,conv,body.get("system"),False,False,None,None,True,history)
-                        answer=result.get("choices",[{}])[0].get("message",{}).get("content","")
+                    if _task_intent(prompt):
+                        # Actionable coding/environment task -> full hybrid agent.
+                        try:
+                            result=general_agent(prompt,conv,None,int(body.get("steps",4)))
+                            answer=result.get("answer","")
+                        except Exception as e:
+                            log_error("chat_hybrid_fallback",e)
+                            result=chat(prompt,conv,body.get("system"),False,False,None,None,True,history)
+                            answer=result.get("choices",[{}])[0].get("message",{}).get("content","")
+                    else:
+                        # Casual / creative / Q&A -> just chat (no file inspection).
+                        try:
+                            result=chat(prompt,conv,body.get("system"),False,False,None,None,True,history)
+                            answer=result.get("choices",[{}])[0].get("message",{}).get("content","")
+                        except Exception as e:
+                            log_error("chat_auto_fallback",e)
+                            answer="I ran into an error: "+str(e)
+                            result={"choices":[]}
                 else:
                     result=chat(prompt,conv,body.get("system"),False,False,model,None,True,history)
                     answer=result.get("choices",[{}])[0].get("message",{}).get("content","")
@@ -3684,6 +3695,17 @@ def _web_answer_prompt(prompt):
             "actually see, cite each source URL, and if results are thin say what you found.")
     joined = "\n\n".join(("SOURCE " + str(i.get("url")) + "\n" + (i.get("content") or "")) for i in items)
     return prompt + "\n\n" + head + "\n\n" + joined, sources, digest
+
+_AGENT_TASK_RE1 = re.compile(r"\b(code|script|program|function|class|bug|fix|debug|refactor|implement|build|compile|tests?|repo|repository|file|folder|directory|terminal|command|api|endpoint|database|sql|docker|package|readme|commit|merge|branch)\b", re.I)
+_AGENT_TASK_RE2 = re.compile(r"\b(write|create|make|add|modify|update|delete|run|break|repair|inspect|scan|analyze|set up|install)\b[\s\S]{0,60}\b(code|function|class|script|file|module|program|app|tool|method|test|dependency|environment|config|server)\b", re.I)
+def _task_intent(p):
+    # True when a prompt is an actionable coding/environment task that should go
+    # to the hybrid agent (plan -> local implement -> online review). Casual,
+    # creative or Q&A prompts return False so they are answered by normal chat.
+    pl = p or ""
+    if _AGENT_TASK_RE1.search(pl): return True
+    if _AGENT_TASK_RE2.search(pl): return True
+    return False
 
 def complexity_score(p):
     if len(p)>7000 or re.search(r"\b(analyze|debug|architect|prove|compare|research|multi[- ]step|plan)\b",p,re.I): return "reasoning"
