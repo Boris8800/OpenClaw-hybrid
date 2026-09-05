@@ -123,6 +123,29 @@ def read_events(limit=100):
         except Exception: pass
     return rows
 
+def _read_activity_since(offset):
+    if not ACTIVITY_FILE.exists(): return []
+    try:
+        with ACTIVITY_FILE.open("rb") as f:
+            f.seek(offset); data=f.read()
+    except Exception: return []
+    out=[]
+    for line in data.decode("utf-8",errors="ignore").splitlines():
+        line=line.strip()
+        if not line: continue
+        try: out.append(json.loads(line))
+        except Exception: pass
+    return out
+
+def model_usage_since(offset):
+    """Unique (model, role) pairs actually called since byte offset in the activity log."""
+    usage=[]
+    for rec in _read_activity_since(offset):
+        if rec.get("event")=="model_attempt":
+            entry={"model":rec.get("model","") or "?","role":"supervisor" if rec.get("supervisor") else "worker"}
+            if entry not in usage: usage.append(entry)
+    return usage
+
 def validate_goal(goal):
     if not goal or len(goal.strip()) < 3: raise ValueError("goal must contain at least 3 characters")
     if len(goal) > int(os.getenv("OPENCLAW_MAX_GOAL_CHARS","10000")): raise ValueError("goal is too long")
@@ -1045,9 +1068,9 @@ def _load_inbox():
     except Exception: return []
 def _save_inbox(items):
     INBOX_FILE.write_text(json.dumps(items,indent=2,ensure_ascii=False),encoding="utf-8")
-def agent_inbox_add(goal, conversation="agent", steps=4):
+def agent_inbox_add(goal, conversation="agent", steps=4, name=None):
     goal=validate_goal(goal)
-    items=_load_inbox(); item={"id":str(uuid.uuid4()),"goal":goal,"conversation":conversation or "agent","steps":int(steps) or 4,"status":"queued","created":int(time.time()),"started":None,"finished":None,"result":None,"error":None}
+    items=_load_inbox(); item={"id":str(uuid.uuid4()),"goal":goal,"name":(name or "").strip() or goal[:50],"conversation":conversation or "agent","steps":int(steps) or 4,"status":"queued","created":int(time.time()),"started":None,"finished":None,"result":None,"error":None}
     items.append(item); _save_inbox(items)
     log_event("agent_queued",task_id=item["id"],goal=goal[:200]); return item
 def agent_inbox_list():
@@ -1064,27 +1087,61 @@ def agent_inbox_retry(tid):
             x["status"]="queued"; x["error"]=None; x["started"]=None; x["finished"]=None; _save_inbox(items)
             log_event("agent_retried",task_id=tid); return {"ok":True,"id":tid,"status":"queued"}
     return {"error":"job not found or not failed","id":tid}
+def agent_inbox_delete(tid):
+    items=_load_inbox(); keep=[x for x in items if x.get("id")!=tid]
+    _save_inbox(keep); log_event("agent_deleted",task_id=tid); return len(keep)!=len(items)
+def agent_inbox_move(tid, delta):
+    items=_load_inbox()
+    idx=next((i for i,x in enumerate(items) if x.get("id")==tid),None)
+    if idx is None: return False
+    j=idx+int(delta or 0)
+    if 0<=j<len(items):
+        items[idx],items[j]=items[j],items[idx]; _save_inbox(items); log_event("agent_moved",task_id=tid)
+        return True
+    return False
+
+AGENT_LOCK=threading.Lock()
+def _agent_claim():
+    with AGENT_LOCK:
+        items=_load_inbox(); job=None
+        for x in items:
+            if x.get("status")=="queued": job=x; break
+        if job:
+            job["status"]="running"; job["started"]=int(time.time()); _save_inbox(items)
+        return job
+
 def agent_worker():
-    """Background daemon: pulls queued goals and runs the general agent."""
+    """Background daemon (run N concurrently): claims a queued goal, runs it, records result."""
     while True:
         try:
-            items=_load_inbox(); job=None
-            for x in items:
-                if x.get("status")=="queued": job=x; break
+            job=_agent_claim()
             if not job:
                 time.sleep(2); continue
-            job["status"]="running"; job["started"]=int(time.time()); _save_inbox(items)
             log_event("agent_started",task_id=job["id"])
+            out={"status":"done","result":"","error":None}
             try:
                 res=general_agent(job["goal"],job["conversation"],None,int(job["steps"]))
-                job["result"]=res.get("answer",""); job["status"]="done"
+                out["result"]=res.get("answer","")
             except Exception as e:
-                job["error"]=str(e); job["status"]="failed"; log_event("agent_failed",task_id=job["id"],error=str(e))
-            job["finished"]=int(time.time()); _save_inbox(items); time.sleep(1)
+                out["status"]="failed"; out["error"]=str(e); log_event("agent_failed",task_id=job["id"],error=str(e))
+            with AGENT_LOCK:
+                items=_load_inbox()
+                for x in items:
+                    if x.get("id")==job["id"]:
+                        x["status"]=out["status"]; x["finished"]=int(time.time())
+                        if out["status"]=="done": x["result"]=out["result"]
+                        x["error"]=out["error"]
+                _save_inbox(items)
+            try: comms_task_notify(out["status"], job.get("goal"), (out.get("result") or out.get("error") or "")[:1500])
+            except Exception: pass
+            time.sleep(1)
         except Exception:
             time.sleep(3)
 def start_agent_worker():
-    t=threading.Thread(target=agent_worker,daemon=True); t.start(); return t
+    n=int(os.getenv("OPENCLAW_AGENT_CONCURRENCY","2")); n=max(1,min(6,n))
+    threads=[threading.Thread(target=agent_worker,daemon=True) for _ in range(n)]
+    for t in threads: t.start()
+    return threads
 
 def run_all(web_port=8765):
     """Start the web Control Center + background agent daemon together (non-blocking)."""
@@ -1108,6 +1165,8 @@ FRONTEND_HTML = '''<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>OpenClaw Control Center</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<meta name="theme-color" content="#0a0f1a">
 <style>
 :root{
   --bg:#0a0f1a; --panel:#111827; --panel2:#16213a; --panel3:#1c2a47; --line:#26334f;
@@ -1262,6 +1321,33 @@ body.light pre,body.light textarea,body.light input,body.light select{color:#1c2
 .toast{display:flex;align-items:center;gap:10px}
 .toast .t-x{margin-left:auto;cursor:pointer;opacity:.7;font-weight:700}
 .toast .t-x:hover{opacity:1}
+/* Floating live-activity window (web search / page fetch while a turn runs) */
+.livepanel{position:fixed;right:16px;bottom:16px;width:min(380px,94vw);max-height:52vh;display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--accent2);border-radius:12px;box-shadow:var(--shadow);z-index:70;overflow:hidden}
+.livepanel-hd{display:flex;align-items:center;gap:8px;padding:9px 12px;border-bottom:1px solid var(--line);font-weight:700;font-size:0.857rem;color:var(--accent2);text-transform:uppercase;letter-spacing:.6px}
+.livepanel-hd .dotp{width:8px;height:8px;border-radius:50%;background:var(--ok);animation:pulse 1.1s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+.livepanel-hd button{margin-left:auto;background:none;border:0;color:var(--muted);cursor:pointer;font-size:1.05rem;line-height:1}
+.livepanel-bd{padding:10px 12px;overflow:auto;font-size:0.857rem;color:var(--muted);line-height:1.75;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;word-break:break-word}
+.livepanel-bd .live-x{color:var(--accent2)}
+.livepanel-bd .live-end{color:var(--ok);font-weight:600;margin-top:6px}
+/* Chat list tabs */
+.chattabs{display:flex;gap:8px;overflow-x:auto;padding:2px 0 4px;align-items:center}
+.chattab{flex:0 0 auto;display:inline-flex;align-items:center;gap:7px;max-width:230px;background:var(--panel2);border:1px solid var(--line);color:var(--muted);border-radius:20px;padding:6px 12px;font-size:0.857rem;cursor:pointer;transition:background .12s,color .12s,border-color .12s;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.chattab .tt{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chattab:hover{color:var(--txt);border-color:var(--accent)}
+.chattab.active{background:rgba(91,140,255,.18);border-color:var(--accent);color:#fff}
+.chattab .pin{color:var(--accent2);font-size:0.786rem}
+.chattab .x{margin-left:4px;opacity:.6;font-weight:700}
+.chattab .x:hover{opacity:1;color:var(--bad)}
+
+/* Communications live inside Settings, styled as a clearly distinct group */
+.comms-sec{position:relative;margin:0 0 26px;padding:2px 18px 16px;border:1px solid var(--line);border-left:3px solid var(--accent2);border-radius:14px;background:linear-gradient(180deg,rgba(125,224,245,.06),transparent 40%)}
+.comms-sec::before{content:'';position:absolute;left:-3px;top:0;bottom:0;width:3px;border-radius:3px;background:var(--accent2)}
+.comms-sec-hd{display:flex;align-items:baseline;gap:10px;padding:12px 0 4px;margin-bottom:4px;border-bottom:1px dashed var(--line)}
+.comms-sec-hd .t{font-weight:800;font-size:0.929rem;letter-spacing:1.2px;text-transform:uppercase;color:var(--accent2)}
+.comms-sec-hd .s{color:var(--muted);font-size:0.857rem}
+.comms-sec .panel{border-left:2px solid rgba(125,224,245,.35)}
+.comms-sec .panel .hd{background:transparent}
 </style></head>
 <body>
 <div class="layout">
@@ -1277,7 +1363,6 @@ body.light pre,body.light textarea,body.light input,body.light select{color:#1c2
       <button data-v="memory"><span class="ic">◍</span>Memory</button>
       <button data-v="tools"><span class="ic">⊞</span>Tools</button>
       <button data-v="terminal"><span class="ic">▸</span>Terminal</button>
-      <button data-v="comms"><span class="ic">✆</span>Communications</button>
       <button data-v="system"><span class="ic">◎</span>System</button>
       <button data-v="settings"><span class="ic">⚙</span>Settings</button>
     </nav>
@@ -1316,25 +1401,50 @@ body.light pre,body.light textarea,body.light input,body.light select{color:#1c2
 
     <!-- CHAT -->
     <section class="view" id="view-chat">
+      <div class="panel" style="padding:8px 10px;box-shadow:none">
+        <div class="chattabs" id="chat-tabs"></div>
+      </div>
+      <div class="panel" style="padding:8px 12px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;box-shadow:none">
+        <button class="btn ghost sm" id="chat-new" title="Start a new chat">＋ New chat</button>
+        <button class="btn ghost sm" id="chat-rename" title="Rename the selected chat">Rename</button>
+        <button class="btn ghost sm" id="chat-pin" title="Pin to top / unpin">Pin</button>
+        <button class="btn ghost sm" id="chat-up" title="Move up in order">▲ Up</button>
+        <button class="btn ghost sm" id="chat-dn" title="Move down in order">▼ Down</button>
+        <button class="btn ghost sm" id="chat-del" title="Delete the selected chat" style="color:var(--bad)">Delete</button>
+        <span class="statusline" id="chat-conv-status"></span>
+      </div>
       <div class="panel"><div class="hd">Chat
         <span class="statusline" style="margin-left:auto;margin-right:8px" id="chat-tools-status"></span>
-        <button class="btn ghost sm" id="chat-copy" title="Copy the conversation">⧉ Copy</button>
-        <button class="btn ghost sm" id="chat-dl" title="Download the conversation as text">↓ Download</button>
+        <button class="btn ghost sm" id="chat-remember" title="Save this conversation into memory">◈ Remember</button>
+        <button class="btn ghost sm" id="chat-export-json" title="Download the conversation as JSON">JSON</button>
+        <button class="btn ghost sm" id="chat-dl" title="Download the conversation as Markdown">↓ MD</button>
+        <button class="btn ghost sm" id="chat-live" title="Show live web-search/fetch activity while a turn runs">○ Live: off</button>
         <button class="btn ghost sm" id="chat-clear" title="Clear the conversation" style="margin-left:8px">✕ Clear</button>
       </div><div class="bd">
         <div class="chatbox" id="chatbox"><div class="msg bot"><div class="msg-top"><span class="who">OpenClaw</span><span class="ts" id="welcome-ts"></span></div><div class="msg-body" id="welcome-body">Checking model connection…</div><div class="msg-foot"><button class="msg-rev" title="Reverse this message">↔ reverse</button></div></div></div>
         <div class="composer">
           <div class="chat-ctrl">
             <select id="chat-mode">
-              <option value="auto">Auto · hybrid agent</option>
+              <option value="auto">Auto · worker agent</option>
               <option value="chat">Chat only</option>
+              <option value="web">Web research · live search</option>
             </select>
             <select id="chat-model"><option value="">default worker model</option></select>
           </div>
           <textarea id="chat-input" rows="2" placeholder="Type a message…"></textarea>
+          <button class="icon-btn" id="chat-mic" title="Voice input (mic)">🎤</button>
           <button class="btn" id="chat-send">Send</button>
+          <button class="btn ghost" id="chat-stop" style="display:none">■ Stop</button>
         </div>
-        <div class="sub" id="chat-count" style="margin-top:4px;text-align:right"></div>
+        <div class="row" id="chat-recipes" style="gap:6px;margin-top:8px;align-items:center">
+          <span class="statusline" style="color:var(--muted)">Quick:</span>
+        </div>
+        <div class="row" style="gap:6px;margin-top:6px;align-items:center">
+          <span class="badge" id="workchip" style="display:none;color:var(--accent2);border-color:rgba(125,224,245,.4)"><span class="spin"></span> <span id="workword"></span></span>
+          <span class="badge" id="chat-meta-mode">auto</span>
+          <span class="statusline" id="chat-meta" style="color:var(--muted);flex:1">loading model info…</span>
+          <span class="statusline" id="chat-count" style="white-space:nowrap"></span>
+        </div>
       </div></div>
 
       <div class="panel" id="chat-todos">
@@ -1360,28 +1470,43 @@ body.light pre,body.light textarea,body.light input,body.light select{color:#1c2
     <section class="view" id="view-agent">
       <div class="cards" id="agent-cards"></div>
 
-      <div class="panel"><div class="hd">Hybrid agent <span class="sub" style="margin-left:8px">local worker implements · API supervisor plans/reviews</span></div><div class="bd">
-        <div class="field"><label>Goal</label><textarea id="agent-goal" rows="3" placeholder="Describe the task for the hybrid agent to plan, implement and verify…"></textarea></div>
+      <div class="panel"><div class="hd">New agent session <span class="sub" style="margin-left:8px">local worker implements · API supervisor plans/reviews · runs concurrently</span></div><div class="bd">
+        <div class="field"><label>Session name (optional)</label><input type="text" id="agent-name" placeholder="e.g. Fix the login bug"></div>
+        <div class="field"><label>Goal</label><textarea id="agent-goal" rows="3" placeholder="Describe the task for the agent to plan, implement and verify…"></textarea></div>
         <div class="row">
           <div class="field" style="flex:1"><label>Steps</label><input type="number" id="agent-steps" value="4" min="1" max="12"></div>
           <div class="field" style="flex:1"><label>Conversation</label><input type="text" id="agent-conv" value="agent"></div>
         </div>
         <div class="row" style="gap:8px;align-items:center">
-          <button class="btn" id="agent-run">▶ Run hybrid agent now</button>
+          <button class="btn" id="agent-run">▶ Start agent session</button>
           <button class="btn ghost" id="agent-queue">Queue in background</button>
           <span class="statusline" id="agent-status" style="margin-left:auto"></span>
         </div>
       </div></div>
 
       <div class="panel"><div class="hd">Live task state <span class="statusline" style="margin-left:auto" id="task-status"></span></div>
-        <div class="bd" id="task-panel"><div class="empty">no task state yet — run the hybrid agent</div></div>
+        <div class="bd" id="task-panel"><div class="empty">no task running yet</div></div>
       </div>
 
-      <div class="panel"><div class="hd">Jobs <span class="statusline" style="margin-left:auto" id="agent-refresh"></span>
+      <div class="panel"><div class="hd">Sessions / jobs <span class="statusline" style="margin-left:auto" id="agent-refresh"></span>
         <button class="btn ghost" id="agent-clear-done" style="margin-left:8px">Clear done</button>
       </div>
         <div class="bd" id="agent-list"></div>
       </div>
+
+      <div class="panel"><div class="hd">Schedule tasks &amp; reminders
+        <span class="statusline" style="margin-left:auto" id="sched-status"></span>
+      </div><div class="bd">
+        <div class="row">
+          <div class="field" style="flex:1"><label>Type</label><select id="sched-type"><option value="reminder">Reminder</option><option value="agent">Agent goal</option></select></div>
+          <div class="field" style="flex:3"><label>Text / goal</label><input type="text" id="sched-text" placeholder="e.g. Send me a note, or a background goal"></div>
+          <div class="field" style="flex:1"><label>In (minutes)</label><input type="number" id="sched-in" value="5" min="0"></div>
+          <div class="field" style="flex:1"><label>Repeat every (min, 0=none)</label><input type="number" id="sched-repeat" value="0" min="0"></div>
+          <div style="flex:0;display:flex;align-items:flex-end"><button class="btn" id="sched-add">Add</button></div>
+        </div>
+        <div class="sub" style="color:var(--muted);margin:8px 0 4px">Reminders notify you via an enabled connector (Telegram/Slack/Discord) if configured; agent goals run in the background and notify on completion.</div>
+        <div id="sched-list"><div class="empty">nothing scheduled</div></div>
+      </div></div>
     </section>
 
     <!-- MEMORY -->
@@ -1445,16 +1570,6 @@ body.light pre,body.light textarea,body.light input,body.light select{color:#1c2
       </div>
     </section>
 
-    <!-- COMMUNICATIONS -->
-    <section class="view" id="view-comms">
-      <div class="cards" id="comms-cards"></div>
-      <div class="statusline" style="margin:-10px 0 14px" id="comms-status"></div>
-      <div id="comms-connectors"></div>
-      <div class="panel"><div class="hd">Message log <span class="statusline" style="margin-left:8px">last 150 across connectors</span>
-        <button class="btn ghost" id="comms-clear" style="margin-left:auto">Clear log</button>
-      </div><div class="bd" id="comms-log"><div class="empty">no traffic yet</div></div></div>
-    </section>
-
     <!-- SYSTEM -->
     <section class="view" id="view-system">
       <div class="cards" id="sys-cards"></div>
@@ -1471,6 +1586,17 @@ body.light pre,body.light textarea,body.light input,body.light select{color:#1c2
 
     <!-- SETTINGS -->
     <section class="view" id="view-settings">
+      <!-- COMMUNICATIONS: kept inside Settings, visually distinct from model/env settings -->
+      <div class="comms-sec">
+        <div class="comms-sec-hd"><span class="t">◈ Communications &amp; messaging</span>
+          <span class="s">connect Telegram, Slack &amp; Discord to OpenClaw</span></div>
+        <div class="cards" id="comms-cards"></div>
+        <div class="statusline" style="margin:-8px 0 12px" id="comms-status"></div>
+        <div id="comms-connectors"></div>
+        <div class="panel"><div class="hd">Message log <span class="statusline" style="margin-left:8px">last 150 across connectors</span>
+          <button class="btn ghost" id="comms-clear" style="margin-left:auto">Clear log</button>
+        </div><div class="bd" id="comms-log"><div class="empty">no traffic yet</div></div></div>
+      </div>
       <div class="cards" id="set-cards"></div>
       <div class="panel"><div class="hd">Interface</div><div class="bd">
         <div class="row">
@@ -1491,6 +1617,14 @@ body.light pre,body.light textarea,body.light input,body.light select{color:#1c2
           <div class="field" style="flex:2"><label>Context window</label><input type="text" id="set-local-ctx" placeholder="32768"></div>
         </div>
         <div class="field"><label>API key (only if your local server requires one)</label><input type="password" id="set-local-key" placeholder="leave blank if not required"></div>
+      </div></div>
+
+      <div class="panel"><div class="hd">Auto-detect local model servers
+        <span class="statusline" style="margin-left:auto" id="local-detect-status"></span>
+        <button class="btn ghost sm" id="local-detect" style="margin-left:8px">Scan for servers</button>
+      </div><div class="bd">
+        <div class="sub" style="color:var(--muted)">Finds running OpenAI-compatible servers (Ollama, LM Studio, vLLM, llama.cpp…) on this computer and lists the models they serve. Click a model to use it as the worker.</div>
+        <div id="local-detect-results" style="margin-top:12px"><div class="empty">no scan yet</div></div>
       </div></div>
 
       <div class="panel"><div class="hd">OpenAI</div><div class="bd">
@@ -1527,6 +1661,13 @@ body.light pre,body.light textarea,body.light input,body.light select{color:#1c2
         <span class="statusline" id="set-status" style="margin-left:12px"></span>
       </div></div>
 
+      <div class="panel"><div class="hd">Security (web Control Center)</div><div class="bd">
+        <div class="field"><label>Access token</label><input type="password" id="set-web-token" placeholder="set a token to require login on the web UI" autocomplete="off">
+          <div class="sub" style="color:var(--muted);margin-top:4px">Leave blank and Save to keep the current token. Once set, opening the Control Center from another device will ask for this token. Saves immediately.</div></div>
+        <button class="btn" id="sec-save">Save token</button>
+        <span class="statusline" id="sec-status" style="margin-left:12px"></span>
+      </div></div>
+
       <div class="panel"><div class="hd">Active providers</div><div class="bd">
         <table><thead><tr><th>Model</th><th>Provider</th><th>Role</th></tr></thead><tbody id="set-models"></tbody></table>
       </div></div>
@@ -1535,6 +1676,28 @@ body.light pre,body.light textarea,body.light input,body.light select{color:#1c2
 </div>
 
 <div class="toast" id="toast"></div>
+
+<!-- Login overlay (when a web access token is configured) -->
+<div class="modal" id="login-modal">
+  <div class="modal-backdrop" id="login-backdrop"></div>
+  <div class="modal-box" style="width:min(360px,92vw)">
+    <div class="modal-hd">OpenClaw Control Center · sign in</div>
+    <div class="modal-bd">
+      <p class="sub" style="color:var(--muted);margin:0 0 10px">This Control Center is protected by an access token.</p>
+      <input type="password" id="login-token" placeholder="Access token" autocomplete="off" style="width:100%">
+      <div class="statusline" id="login-status" style="margin-top:8px"></div>
+    </div>
+    <div class="modal-ft"><button class="btn" id="login-submit">Unlock</button></div>
+  </div>
+</div>
+
+<!-- Live activity popup -->
+<div class="livepanel" id="live-panel" hidden>
+  <div class="livepanel-hd"><span class="dotp"></span>Live activity
+    <button id="live-close" title="Close">✕</button>
+  </div>
+  <div class="livepanel-bd" id="live-body"><span class="live-x">Watching the agent — start a Web research or browsing turn to see live activity here.</span></div>
+</div>
 
 <!-- Preset settings modal -->
 <div class="modal" id="preset-modal">
@@ -1554,20 +1717,41 @@ body.light pre,body.light textarea,body.light input,body.light select{color:#1c2
 <script>
 const $=s=>document.querySelector(s);
 const esc=t=>String(t).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+function fmtText(t){
+  let s=esc(t);
+  s=s.replace(/(https?:\/\/[^\s<>"']+)/g,'<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>');
+  s=s.replace(/(^|[\s(])(www\.[^\s<>"']+)/g,'$1<a href="http://$2" target="_blank" rel="noopener noreferrer">$2</a>');
+  return s;
+}
 function toast(msg,err){const t=$('#toast');t.innerHTML=esc(msg)+'<span class="t-x" data-x>×</span>';t.className='toast show'+(err?' err':'');clearTimeout(t._h);t._h=setTimeout(()=>t.className='toast',2600)}
-async function api(path,opts){let r;try{r=await fetch(path,opts);}catch(e){throw new Error('cannot reach control server — is it running? ('+e.message+')')}let j={};try{j=await r.json()}catch(e){j={}}if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j}
+function ocToken(){try{return localStorage.getItem('oc_token')||''}catch(e){return ''}}
+async function api(path,opts){
+  let r;const o=opts||{};const h=Object.assign({},o.headers||{});
+  const tk=ocToken();if(tk&&path.indexOf('/api/auth')!==0)h['X-Oc-Token']=tk;
+  try{r=await fetch(path,Object.assign({},o,{headers:h}));}catch(e){if(e&&e.name==='AbortError')throw e;throw new Error('cannot reach control server — is it running? ('+e.message+')')}
+  if(r.status===401&&path!=='/api/auth'){showLogin();throw new Error('access token required (login shown)');}
+  let j={};try{j=await r.json()}catch(e){j={}}
+  if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j}
 const post=(path,body)=>api(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+/* Global, early-registered close handlers for the live panel (survive any later code) */
+document.addEventListener('click',function(e){
+  var c=e.target&&e.target.closest?e.target.closest('#live-close'):null;
+  if(c){e.preventDefault();e.stopPropagation();if(typeof closeLivePanel==='function')closeLivePanel();}
+});
+document.addEventListener('keydown',function(e){
+  if(e.key==='Escape'){var p=document.getElementById('live-panel');if(p&&!p.hidden&&typeof closeLivePanel==='function')closeLivePanel();}
+});
 
 /* navigation */
-const TITLES={overview:'Overview',chat:'Chat',agent:'Agent Runner',memory:'Memory',tools:'Tools',terminal:'Terminal',comms:'Communications',system:'System',settings:'Settings'};
+const TITLES={overview:'Overview',chat:'Chat',agent:'Agent Manager',memory:'Memory',tools:'Tools',terminal:'Terminal',system:'System',settings:'Settings'};
 let cur='overview';
 function showView(v){document.querySelectorAll('.nav button').forEach(x=>x.classList.toggle('active',x.dataset.v===v));cur=v;
   document.querySelectorAll('.view').forEach(x=>x.classList.toggle('active',x.id==='view-'+v));
   $('#title').textContent=TITLES[v]||v;
   if(v==='memory')loadMemStats();if(v==='tools')loadTools();if(v==='system')loadSystem();if(v==='settings')loadSettings();if(v==='agent')loadAgent();
   if(v==='terminal'){loadTerminal();$('#term-input').focus();}
-  if(v==='chat'){loadTodos();refreshSystemCfg();$('#chat-input').focus();}
-  if(v==='comms'){loadComms();}
+  if(v==='chat'){showDoneTodos=false;const sd=$('#todo-showdone');if(sd)sd.checked=false;loadTodos();loadChats();buildRecipes();refreshSystemCfg();$('#chat-input').focus();}
+  if(v==='settings')loadComms();
   const side=$('.side');if(side)side.classList.remove('open');}
 document.querySelectorAll('.nav button').forEach(b=>b.addEventListener('click',()=>showView(b.dataset.v)));
 
@@ -1669,7 +1853,7 @@ function wireCopy(scope){
 /* refresh current view */
 function refreshView(){
   if(cur==='overview')loadOverview();if(cur==='memory')loadMemStats();
-  if(cur==='tools')loadTools();if(cur==='system')loadSystem();if(cur==='settings')loadSettings();if(cur==='comms')loadComms();if(cur==='agent'){loadAgent();loadTask();}
+  if(cur==='tools')loadTools();if(cur==='system')loadSystem();if(cur==='settings'){loadSettings();loadComms();}if(cur==='agent'){loadAgent();loadTask();}
   if(cur==='chat')loadTodos();
   toast('refreshed');
 }
@@ -1758,9 +1942,27 @@ async function loadModels(sel){
 /* connection state + chat welcome */
 let _sysReady=null;
 async function refreshSystemCfg(){
-  try{window._ocSys=await api('/api/system');applyWelcome();}
-  catch(e){window._ocSys=null;applyWelcome();}
+  try{window._ocSys=await api('/api/system');applyWelcome();updateChatMeta();}
+  catch(e){window._ocSys=null;applyWelcome();updateChatMeta();}
 }
+function chatMetaText(){
+  const c=window._ocSys&&window._ocSys.config;
+  const w=c?(c.worker_model||''):'';const sup=c?(c.supervisor_model||''):'';
+  const hasOnline=(c?((c.models||[]).some(m=>m.role!=='local_worker')):false);
+  const mb=$('#chat-meta-mode');const el=$('#chat-meta');
+  if(!mb||!el)return;
+  const mode=$('#chat-mode')?($('#chat-mode').value||'auto'):'auto';
+  const chosen=$('#chat-model')?($('#chat-model').value||''):'';
+  mb.textContent=mode;
+  const cfg=[];
+  cfg.push(chosen?('model: '+chosen):('model: default worker'+(w?' · '+w:'')));
+  if(w)cfg.push('worker: '+w);else cfg.push('worker: none');
+  if(sup)cfg.push('supervisor: '+sup);else if(hasOnline)cfg.push('supervisor: auto');
+  const ready=!!w&&(c?(c.models||[]).some(m=>m.name===w):false);
+  el.textContent=cfg.join(' · ')+(ready?'':'  ⚠ no active model — configure one in Settings');
+  el.style.color=ready?'var(--muted)':'var(--warn)';
+}
+function updateChatMeta(){chatMetaText();}
 function ocModelReady(){
   const c=window._ocSys&&window._ocSys.config;
   const w=c?c.worker_model:'';
@@ -1786,22 +1988,40 @@ async function sendChat(){
   const input=$('#chat-input');const text=input.value.trim();if(!text)return;
   const box=$('#chatbox');
   const history=chatHistory();
-  box.insertAdjacentHTML('beforeend',`<div class="msg me"><div class="msg-top"><span class="who">You</span><span class="ts">${chatTs()}</span></div><div class="msg-body">${esc(text)}</div><div class="msg-foot"><button class="msg-rev" title="Reverse this message">↔ reverse</button></div></div>`);
+  box.insertAdjacentHTML('beforeend',`<div class="msg me"><div class="msg-top"><span class="who">You</span><span class="ts">${chatTs()}</span></div><div class="msg-body">${fmtText(text)}</div><div class="msg-foot"><button class="msg-rev" title="Reverse this message">↔ reverse</button></div></div>`);
   const model=$('#chat-model').value||null;
   const mode=$('#chat-mode').value||'auto';
-  box.insertAdjacentHTML('beforeend',`<div class="msg bot" id="thinking"><div class="msg-top"><span class="who">OpenClaw</span><span class="ts">${chatTs()}</span></div><div class="msg-body"><span class="spin"></span> thinking…</div><div class="msg-foot"><button class="msg-rev" title="Reverse this message">↔ reverse</button></div></div>`);
+  const t0=performance.now();
+  box.insertAdjacentHTML('beforeend',`<div class="msg bot" id="thinking"><div class="msg-top"><span class="who">OpenClaw</span><span class="ts">${chatTs()}</span></div><div class="msg-body"><span class="spin"></span> working…</div><div class="statusline" id="tk-elapsed" style="margin-top:4px;color:var(--muted)"></div><div class="sub" id="tk-live" style="display:none;margin-top:4px;color:var(--accent2);font-size:0.857rem;line-height:1.6"></div><div class="msg-foot"><button class="msg-rev" title="Reverse this message">↔ reverse</button></div></div>`);
   input.value='';box.scrollTop=box.scrollHeight;
   const btn=$('#chat-send');btn.disabled=true;
+  const target=model?('model '+model):('default worker');
+  const label=mode==='chat'?('chat · '+target):(mode==='web'?('web research · '+target):(mode==='auto'?('worker agent · '+target):target));
+  setRunning(true);showWorkChip('working');
+  const ac=new AbortController();window._ocAbort=ac;
+  const webMode=(mode==='web');
+  window._tkTimer=setInterval(()=>{const e=$('#tk-elapsed');if(e){const s=((performance.now()-t0)/1000).toFixed(1);e.textContent='elapsed '+s+'s · '+label+' · press ■ to stop';}},300);
+  if(webMode||_liveOn)openLivePanel();
+  window._liveOpened=false;
+  window._liveTimer=setInterval(liveTick,900);
+  const clearTimers=()=>{clearInterval(window._tkTimer);window._tkTimer=null;if(window._liveTimer){clearInterval(window._liveTimer);window._liveTimer=null;}if(webMode||_liveOn)liveDone();else hideWorkChip();};
   try{
-    const j=await post('/api/chat',{prompt:text,conversation:'web',model,mode,history});
+    if(!window._convId){try{const nj=await post('/api/chats',{action:'new',title:(text||'').slice(0,40)});window._convId=nj.chat.id;}catch(e){}}
+    const j=await api('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:text,conversation:window._convId||'web',model,mode,history}),signal:ac.signal});
+    clearTimers();
+    if(window._convId){try{await post('/api/chats',{action:'msg',id:window._convId,role:'user',content:text});await post('/api/chats',{action:'msg',id:window._convId,role:'assistant',content:j.answer||''});loadChats();}catch(e){}}
     const srcs=(j.sources||[]).filter(s=>s&&s.url);
     const srcHtml=srcs.length?`<div class="srcs">${srcs.map(s=>`<a href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.title||s.url)}</a>`).join('')}</div>`:'';
     const mdl=j.model||'';const prov=j.provider||'';const role=j.role||'';
     const online=!!role&&role!=='local_worker';
     const badge=mdl?`<span class="chip model-badge ${online?'online':'local'}" title="${esc(prov||'')}${online?' · online API':''}">${esc(mdl)}${online?' ●':''}</span>`:'';
-    $('#thinking').outerHTML=`<div class="msg bot"><div class="msg-top"><span class="who">OpenClaw ${badge}</span><span class="ts">${chatTs()}</span></div><div class="msg-body">${esc(j.answer||'')}</div>${srcHtml}<div class="msg-foot"><button class="msg-rev" title="Reverse this message">↔ reverse</button></div></div>`;
-  }catch(e){$('#thinking').outerHTML=`<div class="msg bot"><div class="msg-top"><span class="who">OpenClaw</span><span class="ts">${chatTs()}</span></div><div class="msg-body"><span style="color:var(--bad)">error: ${esc(e.message)}</span></div><div class="msg-foot"><button class="msg-rev" title="Reverse this message">↔ reverse</button></div></div>`;}
-  finally{btn.disabled=false;box.scrollTop=box.scrollHeight;}
+    const secs=((performance.now()-t0)/1000).toFixed(1);
+    const detail=mdl?`<div class="sub" style="margin-top:6px;color:var(--muted)">answered in ${secs}s · ${esc(mdl)} · ${esc(prov||'')} · ${online?'online supervisor/API':(role==='local_worker'?'local worker':'')}</div>`:'';
+    const mu=j.models_used||[];
+    const rolesHtml=mu.length?`<div class="statusline" style="margin-top:6px">${mu.map(u=>`<span class="chip" title="${u.role==='supervisor'?'Supervisor AI — plans & reviews, never writes/executes':'Local worker — does the actual work'}">${u.role==='supervisor'?'🧠 supervisor':'🤖 worker'} · ${esc(u.model)}</span>`).join(' ')}</div>`:'';
+    $('#thinking').outerHTML=`<div class="msg bot"><div class="msg-top"><span class="who">OpenClaw ${badge}</span><span class="ts">${chatTs()}</span></div><div class="msg-body">${fmtText(j.answer||'')}</div>${detail}${rolesHtml}${srcHtml}<div class="msg-foot"><button class="msg-rev" title="Reverse this message">↔ reverse</button><button class="msg-rev" style="margin-left:auto" onclick="copyText(this.closest('.msg').querySelector('.msg-body').innerText)">copy</button></div></div>`;
+  }catch(e){clearTimers();const stopped=e&&e.name==='AbortError';$('#thinking').outerHTML=`<div class="msg bot"><div class="msg-top"><span class="who">OpenClaw</span><span class="ts">${chatTs()}</span></div><div class="msg-body"><span style="color:${stopped?'var(--warn)':'var(--bad)'}">${stopped?'stopped (request cancelled)':'error: '+esc(e.message)}</span></div><div class="msg-foot"><button class="msg-rev" title="Reverse this message">↔ reverse</button></div></div>`;}
+  finally{setRunning(false);window._ocAbort=null;btn.disabled=false;box.scrollTop=box.scrollHeight;}
 }
 
 /* chat tools */
@@ -1860,12 +2080,197 @@ function copyChat(){
   (navigator.clipboard?navigator.clipboard.writeText(txt):Promise.reject()).then(()=>chatStatus('copied '+chatMsgs().length+' messages')).catch(()=>{prompt('Copy manually:',txt);chatStatus('copy ready');});
 }
 function downloadChat(){
-  const txt=chatTranscript();
-  const blob=new Blob([txt],{type:'text/plain'});
-  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='openclaw-chat-'+new Date().toISOString().slice(0,10)+'.txt';
+  const lines=chatHistory().map(m=>(m.role==='user'?'**You:** ':'**OpenClaw:** ')+m.content).join('\\n\\n');
+  const txt=lines||'(empty chat)';
+  const blob=new Blob([txt],{type:'text/markdown'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='openclaw-chat-'+new Date().toISOString().slice(0,10)+'.md';
   document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(a.href);
-  chatStatus('downloaded');
+  chatStatus('downloaded .md');
 }
+function exportChatJSON(){
+  const data=chatHistory().map(m=>({role:m.role,content:m.content,t:new Date().toISOString()}));
+  const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='openclaw-chat-'+new Date().toISOString().slice(0,10)+'.json';
+  document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(a.href);
+  chatStatus('downloaded .json');
+}
+async function rememberChat(){
+  const items=chatHistory();if(!items.length){toast('Nothing to remember',true);return;}
+  const btn=$('#chat-remember');btn.disabled=true;
+  let ok=0;
+  for(const it of items){
+    try{await post('/api/memory/add',{text:it.content,category:'conversation',tags:['chat'],importance:0.5});ok++;}catch(e){}
+  }
+  btn.disabled=false;toast('Saved '+ok+' message(s) to memory');chatStatus('saved '+ok+' to memory');
+}
+const RECIPES=["Research today's news","Summarize my recent memories","Plan my day","Check my to-dos","Summarize this repository","Write a short story"];
+function buildRecipes(){
+  const el=$('#chat-recipes');if(!el)return;
+  el.querySelectorAll('button.rp').forEach(b=>b.remove());
+  RECIPES.forEach(r=>{
+    const b=document.createElement('button');b.type='button';b.className='chip rp';b.textContent=r;
+    b.title='Fill the box (switch to Web research for live info)';
+    b.addEventListener('click',()=>{const i=$('#chat-input');i.value=r;updateChatCount();i.focus();});
+    el.appendChild(b);
+  });
+}
+function setRunning(run){
+  const s=$('#chat-send'),st=$('#chat-stop');
+  if(s)s.style.display=run?'none':'';if(st)st.style.display=run?'':'none';
+  if(s&&!run)s.disabled=false;
+}
+async function stopChat(){if(window._ocAbort)window._ocAbort.abort();}
+function startVoice(){
+  const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+  if(!SR){toast('Voice input not supported in this browser',true);return;}
+  const rec=new SR();rec.lang='en-US';rec.interimResults=false;
+  rec.onresult=(e)=>{const t=e.results[0][0].transcript;const i=$('#chat-input');if(i){i.value=(i.value+' '+t).trim();updateChatCount();}chatStatus('🎤 heard you');};
+  rec.onerror=(e)=>{chatStatus('mic: '+(e.error||'error'));};
+  rec.onend=()=>{chatStatus('');};
+  rec.start();chatStatus('🎤 listening…');
+}
+
+/* live browsing view: shows the agent's live web search / page-fetch activity */
+let _liveOn=false;
+const _SHORT={'search_started':'searching','search_completed':'results','page_fetch_started':'fetching','page_fetch_completed':'page','chat_web_augmented':'sources','model_attempt':'thinking'};
+function showWorkChip(w){const c=$('#workchip');if(c){c.style.display='';$('#workword').textContent=w||'working';}}
+function hideWorkChip(){const c=$('#workchip');if(c)c.style.display='none';}
+function liveUI(){const b=$('#chat-live');if(b)b.textContent=_liveOn?'● Live: on':'○ Live: off';}
+function liveTarget(){const p=$('#live-panel');if(p&&!p.hidden)return $('#live-body');return null;}
+function openLivePanel(){
+  const p=$('#live-panel');if(!p)return;
+  if(!p.hidden)return;
+  p.hidden=false;
+  const b=$('#live-body');if(b){b.innerHTML='<span class="live-x">Live — watching web research…</span>';}
+}
+function closeLivePanel(){const p=$('#live-panel');if(p)p.hidden=true;_liveOn=false;window._liveOpened=true;liveUI();}
+function toggleLive(){
+  _liveOn=!_liveOn;liveUI();
+  if(_liveOn)openLivePanel();else closeLivePanel();
+  toast(_liveOn?'Live view on — a small window will show the search in real time':'Live view off');
+}
+$('#live-close').addEventListener('click',closeLivePanel);
+const _LIVE_ICON={'search_started':'🔎 searching the web…','search_completed':'✓ got search results','page_fetch_started':'↓ fetching page','page_fetch_completed':'✓ read page','chat_web_augmented':'🧠 building answer from sources','model_attempt':'🤖 asking model'};
+function liveLine(e){
+  const ic=_LIVE_ICON[e.event];if(!ic)return null;
+  let extra='';
+  if(e.event==='page_fetch_started'||e.event==='page_fetch_completed')extra=' '+(e.url||'');
+  else if(e.event==='search_completed')extra=' ('+(e.results||'?')+' results)';
+  else if(e.event==='model_attempt')extra=' '+(e.model||'');
+  else if(e.event==='search_started')extra=' '+((e.query||''));
+  return ic+extra;
+}
+const _BROWSE={'search_started':1,'search_completed':1,'page_fetch_started':1,'page_fetch_completed':1,'chat_web_augmented':1};
+async function liveTick(){
+  try{
+    const j=await api('/api/events?limit=120');const evs=(j.events||[]);
+    let last=null;for(const e of evs){ if(_LIVE_ICON[e.event])last=e; }
+    if(last){const w=_SHORT[last.event];if(w)showWorkChip(w);}
+    const seen=window._liveSeen||(window._liveSeen=new Set());
+    const frag=[];let newBrowse=false;
+    for(const e of evs){
+      const key=(e.time||'')+'|'+(e.event||'')+'|'+(e.url||e.results||e.model||e.query||'');
+      if(seen.has(key))continue;
+      seen.add(key);
+      if(_BROWSE[e.event])newBrowse=true;
+      const ln=liveLine(e);if(ln)frag.push(ln);
+    }
+    if(newBrowse&&!window._liveOpened){window._liveOpened=true;openLivePanel();}
+    const box=liveTarget();if(!box)return;
+    if(frag.length){box.innerHTML+=frag.map(esc).join('<br>');box.scrollTop=box.scrollHeight;}
+  }catch(e){}
+}
+function liveDone(){
+  const t=liveTarget();if(t){t.innerHTML+='<div class="live-end">✓ finished</div>';t.scrollTop=t.scrollHeight;}
+  hideWorkChip();
+}
+async function seedLiveSeen(){
+  try{
+    const j=await api('/api/events?limit=150');const s=new Set();
+    (j.events||[]).forEach(e=>{s.add((e.time||'')+'|'+(e.event||'')+'|'+(e.url||e.results||e.model||e.query||''));});
+    window._liveSeen=s;
+  }catch(e){}
+}
+$('#chat-live').addEventListener('click',toggleLive);
+
+/* chat history / conversations */
+let _convId=null;
+function convStatus(m){const el=$('#chat-conv-status');if(el){el.textContent=m;clearTimeout(el._h);el._h=setTimeout(()=>el.textContent='',2600);}}
+async function loadChats(){
+  try{
+    const j=await api('/api/chats');const list=j.chats||[];
+    const el=$('#chat-tabs');if(!el)return;
+    el.innerHTML=list.map(c=>{
+      const act=c.id===window._convId?' active':'';
+      const pin=c.pinned?'<span class="pin">📌</span>':'';
+      return `<button class="chattab${act}" data-id="${esc(c.id)}" title="${esc(c.title)}"><span class="pin">${pin?pin:''}</span><span class="tt">${esc(c.title)} <span style="opacity:.6">· ${c.count}</span></span><span class="x" data-del="${esc(c.id)}" title="Delete this chat">✕</span></button>`;
+    }).join('')||'<span class="statusline" style="color:var(--muted)">no chats yet</span>';
+  }catch(e){}
+}
+function cpMsg(btn){copyText(btn.closest('.msg').querySelector('.msg-body').innerText);}
+function chatBubble(role,content,ts){
+  const who=role==='user'?'You':'OpenClaw';const cls=role==='user'?'me':'bot';
+  const tst=ts?new Date(ts*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}):chatTs();
+  const foot=role==='user'?'<button class="msg-rev" title="Reverse this message">↔ reverse</button>'
+    :'<button class="msg-rev" title="Reverse this message">↔ reverse</button><button class="msg-rev" style="margin-left:auto" onclick="cpMsg(this)">copy</button>';
+  return `<div class="msg ${cls}"><div class="msg-top"><span class="who">${who}</span><span class="ts">${tst}</span></div><div class="msg-body">${fmtText(content)}</div><div class="msg-foot">${foot}</div></div>`;
+}
+function showEmptyChat(){
+  const box=$('#chatbox');if(!box)return;
+  box.innerHTML='<div class="msg bot"><div class="msg-top"><span class="who">OpenClaw</span><span class="ts">'+chatTs()+'</span></div><div class="msg-body" id="welcome-body"></div><div class="msg-foot"><button class="msg-rev" title="Reverse this message">↔ reverse</button></div></div>';
+  applyWelcome();box.scrollTop=box.scrollHeight;
+}
+async function openConv(id){
+  if(!id){window._convId=null;showEmptyChat();return;}
+  try{
+    const d=await api('/api/chats/open?id='+encodeURIComponent(id));
+    window._convId=id;const box=$('#chatbox');box.innerHTML='';
+    (d.messages||[]).forEach(m=>{box.insertAdjacentHTML('beforeend',chatBubble(m.role,m.content,m.ts));});
+    if(!(d.messages||[]).length)showEmptyChat();
+    box.scrollTop=box.scrollHeight;
+    convStatus((d.meta.pinned?'📌 pinned · ':'')+d.meta.count+' messages');
+    await loadChats();
+  }catch(e){toast(e.message,true);}
+}
+async function chatNew(){
+  try{const j=await post('/api/chats',{action:'new',title:''});window._convId=j.chat.id;await loadChats();showEmptyChat();convStatus('new chat');}
+  catch(e){toast(e.message,true);}
+}
+async function chatDelete(){
+  if(!window._convId){toast('no chat selected',true);return;}
+  if(!confirm('Delete this chat and its history?'))return;
+  try{await post('/api/chats',{action:'delete',id:window._convId});window._convId=null;await loadChats();showEmptyChat();toast('Chat deleted');}
+  catch(e){toast(e.message,true);}
+}
+async function chatRename(){
+  if(!window._convId){toast('no chat selected',true);return;}
+  const t=prompt('New title for this chat:','');if(t===null)return;
+  try{await post('/api/chats',{action:'rename',id:window._convId,title:t});await loadChats();convStatus('renamed');}catch(e){toast(e.message,true);}
+}
+async function chatPin(){
+  if(!window._convId){toast('no chat selected',true);return;}
+  try{
+    const cur=await api('/api/chats/open?id='+encodeURIComponent(window._convId));
+    await post('/api/chats',{action:'pin',id:window._convId,pinned:!cur.meta.pinned});await loadChats();
+    convStatus(cur.meta.pinned?'unpinned':'pinned to top');
+  }catch(e){toast(e.message,true);}
+}
+async function chatMove(delta){
+  if(!window._convId){toast('no chat selected',true);return;}
+  try{await post('/api/chats',{action:'move',id:window._convId,delta:delta});await loadChats();}catch(e){toast(e.message,true);}
+}
+$('#chat-new').addEventListener('click',chatNew);
+$('#chat-tabs').addEventListener('click',async e=>{
+  const del=e.target.closest('[data-del]');
+  if(del){e.stopPropagation();if(!confirm('Delete this chat and its history?'))return;try{await post('/api/chats',{action:'delete',id:del.dataset.del});if(window._convId===del.dataset.del){window._convId=null;showEmptyChat();}await loadChats();toast('Chat deleted');}catch(err){toast(err.message,true);}return;}
+  const tab=e.target.closest('.chattab');
+  if(tab){openConv(tab.dataset.id);return;}
+});
+$('#chat-rename').addEventListener('click',chatRename);
+$('#chat-del').addEventListener('click',chatDelete);
+$('#chat-pin').addEventListener('click',chatPin);
+$('#chat-up').addEventListener('click',()=>chatMove(-1));
+$('#chat-dn').addEventListener('click',()=>chatMove(1));
 function clearChat(){
   const box=$('#chatbox');
   box.innerHTML='<div class="msg bot"><div class="msg-top"><span class="who">OpenClaw</span><span class="ts">'+chatTs()+'</span></div><div class="msg-body">Chat cleared. Ask me anything.</div><div class="msg-foot"><button class="msg-rev" title="Reverse this message">↔ reverse</button></div></div>';
@@ -1879,9 +2284,12 @@ function updateChatCount(){
   el.textContent=chars+' chars · '+words+' words · ~'+tokens+' tokens';
 }
 $('#chatbox').addEventListener('click',e=>{const b=e.target.closest('.msg-rev');if(b)reverseMsg(b);});
-$('#chat-copy').addEventListener('click',copyChat);
 $('#chat-dl').addEventListener('click',downloadChat);
+$('#chat-export-json').addEventListener('click',exportChatJSON);
+$('#chat-remember').addEventListener('click',rememberChat);
 $('#chat-clear').addEventListener('click',clearChat);
+$('#chat-mic').addEventListener('click',startVoice);
+$('#chat-stop').addEventListener('click',stopChat);
 $('#chat-input').addEventListener('input',updateChatCount);
 
 /* agent */
@@ -1890,22 +2298,30 @@ async function submitAgent(runNow){
   const goal=$('#agent-goal').value.trim();if(!goal){toast('Enter a goal',true);return;}
   $('#agent-run').disabled=true;$('#agent-status').textContent='submitting…';
   try{
-    const j=await post('/api/agent/queue',{goal,conversation:$('#agent-conv').value||'agent',steps:parseInt($('#agent-steps').value)||4});
-    $('#agent-goal').value='';
-    $('#agent-status').textContent=(runNow?'running':'queued')+' · '+j.status;
-    toast(runNow?'Hybrid agent started':'Goal queued for the hybrid agent');
-    if(runNow){$('#view-agent').scrollIntoView({behavior:'smooth',block:'start'});}
-    loadAgent();loadTask();
+    const j=await post('/api/agent/queue',{goal,name:$('#agent-name').value.trim(),conversation:$('#agent-conv').value||'agent',steps:parseInt($('#agent-steps').value)||4});
+    $('#agent-goal').value='';$('#agent-name').value='';
+    $('#agent-status').textContent='queued · '+j.status;
+    toast('Agent session queued');loadAgent();loadTask();
   }catch(e){$('#agent-status').textContent='error: '+e.message;toast(e.message,true);}
   finally{$('#agent-run').disabled=false;}
 }
 function jobHtml(x){
   const stCls=x.status==='done'?'var(--ok)':x.status==='failed'?'var(--bad)':x.status==='running'?'var(--accent2)':'var(--muted)';
   const dur=(x.finished&&x.started)?(' · '+Math.round(x.finished-x.started)+'s'):'';
+  const title=(x.name||x.goal||'').slice(0,60);
   const body=x.status==='done'?esc((x.result||'').slice(0,400)):(x.error?`<span style="color:var(--bad)">${esc(x.error)}</span>`:'');
   const full=x.status==='done'?esc(x.result||''):'';
-  const retry=x.status==='failed'?` <button class="btn ghost sm" data-retry="${esc(x.id)}">retry</button>`:'';
-  return `<div class="ev"><span class="k" style="color:${stCls}">${esc(x.status)}</span> <span class="t">${fmtTime(x.created)}</span>${dur} · ${esc(x.goal)}${retry}
+  const retry=x.status==='failed'?`<button class="btn ghost sm" data-retry="${esc(x.id)}">retry</button>`:'';
+  const del=`<button class="btn ghost sm" data-adel="${esc(x.id)}" title="Delete this session">✕</button>`;
+  const up=x.status==='queued'?`<button class="icon-btn" data-amove="${esc(x.id)}" data-d="-1" title="Move up">▲</button>`:'';
+  const dn=x.status==='queued'?`<button class="icon-btn" data-amove="${esc(x.id)}" data-d="1" title="Move down">▼</button>`:'';
+  return `<div class="ev"><div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+    <span class="k" style="color:${stCls}">${esc(x.status)}</span>
+    <b style="color:var(--txt)">${esc(title)}</b>
+    <span class="t">${fmtTime(x.created)}${dur}</span>
+    <span style="margin-left:auto"></span>${up}${dn}${retry}${del}
+    </div>
+    <div class="d" style="margin-top:2px">${esc(x.goal)}</div>
     <div class="d">${body||'<span style="color:var(--muted)">(no output)</span>'}</div>
     ${full?`<details><summary>full result</summary><pre style="white-space:pre-wrap;font-size:0.857rem;color:var(--muted)">${full}</pre></details>`:''}</div>`;
 }
@@ -1917,9 +2333,11 @@ async function loadAgent(){
     <div class="card"><div class="label">Done</div><div class="val">${j.done}</div></div>
     <div class="card"><div class="label">Failed</div><div class="val">${j.failed}</div></div>`;
     const rows=j.items.slice().reverse().map(jobHtml).join('');
-    $('#agent-list').innerHTML=rows||'<div class="empty">no jobs yet — describe a goal and run the hybrid agent</div>';
+    $('#agent-list').innerHTML=rows||'<div class="empty">no sessions yet — describe a goal to start one</div>';
     $('#agent-refresh').textContent='auto-refresh · '+(j.queued+j.running)+' active';
     $('#agent-list').querySelectorAll('button[data-retry]').forEach(b=>b.addEventListener('click',async()=>{try{await post('/api/agent/retry',{id:b.dataset.retry});toast('Job requeued');loadAgent();}catch(e){toast(e.message,true);}}));
+    $('#agent-list').querySelectorAll('button[data-adel]').forEach(b=>b.addEventListener('click',async()=>{try{await post('/api/agent/delete',{id:b.dataset.adel});toast('Session deleted');loadAgent();}catch(e){toast(e.message,true);}}));
+    $('#agent-list').querySelectorAll('button[data-amove]').forEach(b=>b.addEventListener('click',async()=>{try{await post('/api/agent/move',{id:b.dataset.amove,delta:parseInt(b.dataset.d)||0});loadAgent();}catch(e){toast(e.message,true);}}));
   }catch(e){$('#agent-list').innerHTML='<div class="empty">failed to load queue</div>';}
 }
  async function loadTask(){
@@ -1962,12 +2380,43 @@ async function clearDone(){
   try{const j=await post('/api/agent/clear',{});toast('Cleared '+j.removed+' finished jobs');loadAgent();}catch(e){toast(e.message,true);}
 }
 function startAgentPoll(){
-  clearInterval(agentTimer);agentTimer=setInterval(()=>{loadAgent();loadTask();},2500);
+  clearInterval(agentTimer);agentTimer=setInterval(()=>{loadAgent();loadTask();loadSched();},2500);
 }
 $('#agent-run').addEventListener('click',()=>submitAgent(true));
 $('#agent-queue').addEventListener('click',()=>submitAgent(false));
 $('#agent-clear-done').addEventListener('click',clearDone);
 startAgentPoll();
+
+/* scheduler */
+function fmtIn(min){
+  if(min<1)return 'now';
+  if(min<60)return Math.round(min)+'m';
+  return Math.round(min/60)+'h '+Math.round(min%60)+'m';
+}
+async function loadSched(){
+  const el=$('#sched-list');if(!el)return;
+  try{
+    const j=await api('/api/schedule');const items=j.items||[];
+    $('#sched-status').textContent=items.length+' scheduled';
+    if(!items.length){el.innerHTML='<div class="empty">nothing scheduled</div>';return;}
+    el.innerHTML=items.map(it=>{
+      const kind=it.kind==='agent'?'🤖 agent':'⏰ reminder';
+      const inmin=(it.in_secs||0)/60;
+      const rep=it.repeat?(' · repeats every '+fmtIn((it.repeat||0)/60)):'';
+      return `<div class="ev"><span class="k">${kind}</span> <span class="t">in ${fmtIn(inmin)}${rep}</span><div class="d">${esc(it.text||'')} <button class="btn ghost sm" data-sdel="${esc(it.id)}">remove</button></div></div>`;
+    }).join('');
+    el.querySelectorAll('[data-sdel]').forEach(b=>b.addEventListener('click',async()=>{try{await post('/api/schedule/remove',{id:b.dataset.sdel});toast('Removed');loadSched();}catch(e){toast(e.message,true);}}));
+  }catch(e){el.innerHTML='<div class="empty">schedule unavailable</div>';}
+}
+$('#sched-add').addEventListener('click',async()=>{
+  const text=$('#sched-text').value.trim();if(!text){toast('Enter text/goal',true);return;}
+  const kind=$('#sched-type').value;const inmin=parseInt($('#sched-in').value)||0;const rep=parseInt($('#sched-repeat').value)||0;
+  try{
+    await post('/api/schedule',{kind,text,in_minutes:inmin,repeat_minutes:rep});
+    $('#sched-text').value='';toast('Scheduled');loadSched();
+  }catch(e){toast(e.message,true);}
+});
+$('#sched-text').addEventListener('keydown',e=>{if(e.key==='Enter')$('#sched-add').click();});
 
 /* memory */
 async function loadMemStats(){
@@ -2299,6 +2748,8 @@ async function heartbeat(){
   catch(e){$('#hd-status').textContent='offline';$('#hd-dot').className='dot bad';}
 }
 $('#chat-send').addEventListener('click',sendChat);
+$('#chat-mode').addEventListener('change',updateChatMeta);
+$('#chat-model').addEventListener('change',updateChatMeta);
 $('#toast').addEventListener('click',e=>{if(e.target.classList.contains('t-x'))$('#toast').className='toast';});
 $('#chat-input').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendChat()}});
 $('#mem-add').addEventListener('click',async()=>{
@@ -2332,6 +2783,43 @@ $('#todo-add').addEventListener('click',async()=>{
   try{await post('/api/todo/add',{text,priority:parseInt($('#todo-pri').value)||0});$('#todo-text').value='';loadTodos();}catch(e){toast(e.message,true)}
 });
 $('#set-save').addEventListener('click',saveSettings);
+
+/* auto-detect local model servers (Ollama / LM Studio / vLLM / llama.cpp ...) */
+async function detectLocalServers(){
+  const btn=$('#local-detect');const st=$('#local-detect-status');const out=$('#local-detect-results');
+  if(!btn)return;
+  btn.disabled=true;st.textContent='scanning common local ports…';out.innerHTML='<div class="empty">scanning…</div>';
+  try{
+    const j=await api('/api/local/detect');
+    const srv=j.servers||[];
+    st.textContent=srv.length?('found '+srv.length+' server(s)'):'none found';
+    if(!srv.length){out.innerHTML='<div class="empty">No local model server detected on the usual ports.<br>Start Ollama (ollama serve), LM Studio, vLLM or llama.cpp, then rescan.</div>';return;}
+    out.innerHTML=srv.map(s=>
+      `<div class="ev" style="border:1px solid var(--line)">
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <span class="k" style="color:var(--accent2)">${esc(s.name)}</span>
+          <span class="badge">${esc(s.kind)}</span>
+          <span class="t" style="margin-left:auto">${esc(s.url)}</span>
+        </div>
+        <div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:6px">
+          ${(s.models||[]).map(m=>`<button class="chip" data-use data-url="${esc(s.url)}" data-model="${esc(m)}" title="Use ${esc(m)} as the worker model" style="cursor:pointer;border:1px solid var(--line)">${esc(m)} ✚</button>`).join('')||'<span class="t">no models listed</span>'}
+        </div>
+      </div>`).join('');
+  }catch(e){st.textContent='scan failed';out.innerHTML='<div class="empty">scan error: '+esc(e.message)+'</div>';}
+  finally{btn.disabled=false;}
+}
+$('#local-detect').addEventListener('click',detectLocalServers);
+$('#local-detect-results').addEventListener('click',async e=>{
+  const chip=e.target.closest('[data-use]');
+  if(!chip)return;
+  const url=chip.dataset.url;const model=chip.dataset.model;
+  chip.disabled=true;
+  try{
+    const j=await post('/api/settings',{LOCAL_URL:url,LOCAL_MODEL:model});
+    toast('Using '+model+' on '+url);
+    loadSettings();loadModels('#chat-model');loadModels('#agent-model');
+  }catch(err){toast(err.message,true);chip.disabled=false;}
+});
 $('#mem-export').addEventListener('click',exportMem);
 $('#todo-export').addEventListener('click',exportTodos);
 $('#todo-showdone').addEventListener('change',e=>{showDoneTodos=e.target.checked;loadTodos();});
@@ -2342,6 +2830,33 @@ $('#sys-backup').addEventListener('click',async()=>{
   try{const j=await post('/api/backup',{});st.textContent='backup ok · '+j.path+' · '+Math.round(j.bytes/1024)+' KB';toast('Backup created');}catch(e){st.textContent='backup failed: '+e.message;toast(e.message,true);}
 });
 
+/* web access-token login + settings security */
+function showLogin(){const m=$('#login-modal');if(m)m.classList.add('open');const i=$('#login-token');if(i){i.value='';setTimeout(()=>i.focus(),50);}}
+function hideLogin(){const m=$('#login-modal');if(m)m.classList.remove('open');}
+async function submitLogin(){
+  const t=$('#login-token').value.trim();const st=$('#login-status');
+  if(!t){st.textContent='enter a token';return;}
+  st.textContent='checking…';
+  try{
+    await api('/api/auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:t})});
+    try{localStorage.setItem('oc_token',t);}catch(e){}
+    st.textContent='';hideLogin();toast('Unlocked');setTimeout(()=>location.reload(),350);
+  }catch(e){st.textContent='wrong token: '+e.message;}
+}
+$('#login-backdrop').addEventListener('click',hideLogin);
+$('#login-submit').addEventListener('click',submitLogin);
+$('#login-token').addEventListener('keydown',e=>{if(e.key==='Enter')submitLogin();});
+$('#sec-save').addEventListener('click',async()=>{
+  const v=$('#set-web-token').value.trim();const st=$('#sec-status');
+  if(!v){st.textContent='blank = keep the current token (no change)';return;}
+  try{
+    await post('/api/settings',{OPENCLAW_WEB_TOKEN:v});
+    $('#set-web-token').value='';st.textContent='saved — reload to test (a token is now required)';
+    try{localStorage.setItem('oc_token',v);}catch(e){}
+    toast('Web access token set');
+  }catch(e){st.textContent='error: '+e.message;}
+});
+
 /* init */
 (async function init(){
   initTheme();
@@ -2349,14 +2864,25 @@ $('#sys-backup').addEventListener('click',async()=>{
   const _wt=$('#welcome-ts');if(_wt)_wt.textContent=chatTs();
   wireCollapse();
   loadOverview();loadModels('#chat-model');loadModels('#agent-model');loadMemStats();loadMem('');loadTodos();
+  loadChats();
+  seedLiveSeen();
+  buildRecipes();
   refreshSystemCfg();
   heartbeat();setInterval(heartbeat,5000);
   setInterval(()=>{if(cur==='overview')loadOverview()},10000);
   loadAgent();setInterval(()=>{if(cur==='agent')loadAgent()},3000);
-  setInterval(()=>{if(cur==='comms'){const a=document.activeElement;const c=$('#comms-connectors');if(!(a&&c&&c.contains(a)))loadComms();}},5000);
+  setInterval(()=>{if(cur==='settings'){const a=document.activeElement;const c=$('#comms-connectors');if(!(a&&c&&c.contains(a)))loadComms();}},5000);
 })();
 </script>
 </body></html>'''
+
+FAVICON_SVG = b'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#2f66e0"/><stop offset="1" stop-color="#7de0f5"/></linearGradient></defs>
+<rect width="64" height="64" rx="15" fill="#0a0f1a"/>
+<rect x="2" y="2" width="60" height="60" rx="13" fill="none" stroke="url(#g)" stroke-width="3"/>
+<text x="31" y="42" font-family="Arial,Helvetica,sans-serif" font-size="25" font-weight="800" text-anchor="middle" fill="#eaf1ff">OC</text>
+<circle cx="51" cy="13" r="6" fill="#7de0f5"/>
+</svg>'''
 
 class DashboardHandler(BaseHTTPRequestHandler):
     def _send(self, code, body, ctype="application/json"):
@@ -2372,8 +2898,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _qint(self, key, default):
         try: return int(self._qs().get(key,[default])[0])
         except Exception: return default
+    def _authorized(self):
+        tok=os.getenv("OPENCLAW_WEB_TOKEN","").strip()
+        if not tok: return True
+        if self.headers.get("X-Oc-Token","")==tok: return True
+        cookie=self.headers.get("Cookie","") or ""
+        return ("oc_token="+tok) in cookie
+    def _gate(self, path):
+        if not os.getenv("OPENCLAW_WEB_TOKEN","").strip(): return True
+        if path.startswith("/api") or path=="/events":
+            return self._authorized()
+        return True
     def do_GET(self):
         path=urllib.parse.urlparse(self.path).path
+        if not self._gate(path):
+            self._send(401,json.dumps({"ok":False,"error":"unauthorized","login":True})); return
         try:
             if path=="/events":
                 self._send(200,json.dumps(read_events()))
@@ -2381,6 +2920,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send(200,json.dumps({"events":read_events(self._qint("limit",200))}))
             elif path=="/api/health":
                 self._send(200,json.dumps(health_report()))
+            elif path=="/api/schedule":
+                self._send(200,json.dumps(scheduler_list()))
+            elif path=="/api/chats":
+                self._send(200,json.dumps({"chats":conv_list()}))
+            elif path=="/api/chats/open":
+                try:
+                    self._send(200,json.dumps(conv_get(self._qs().get("id",[""])[0])))
+                except Exception as e:
+                    self._send(404,json.dumps({"ok":False,"error":str(e)}))
             elif path=="/api/memory/stats":
                 self._send(200,json.dumps(mem_stats()))
             elif path=="/api/memory/list":
@@ -2397,6 +2945,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send(200,json.dumps(system_resources()))
             elif path=="/api/models":
                 self._send(200,json.dumps([{"name":m["name"],"provider":m.get("provider"),"role":m.get("role"),"url":m.get("url",""),"context_window":int(m.get("context_window",32768)),"vision":m.get("vision",False),"tool_calls":m.get("tool_calls",False)} for m in MODELS]))
+            elif path=="/api/local/detect":
+                self._send(200,json.dumps({"servers":detect_local_servers()}))
             elif path=="/api/tools":
                 self._send(200,json.dumps(TOOL_REGISTRY))
             elif path=="/api/todos":
@@ -2407,8 +2957,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send(200,json.dumps(comms_connector_status()))
             elif path=="/api/system":
                 self._send(200,json.dumps({"system":safe_local_tool("system_info"),"config":{"openclaw_home":str(ROOT),"worker_model":worker_model_name(),"supervisor_model":SUPERVISOR_MODEL_NAME,"terminal_policy":os.getenv("LOCAL_TERMINAL_POLICY","worker"),"models":[{"name":m["name"],"provider":m.get("provider"),"role":m.get("role"),"vision":m.get("vision",False),"tool_calls":m.get("tool_calls",False),"context_window":int(m.get("context_window",32768))} for m in MODELS],"provider_keys":{"openai":provider_keyed("openai"),"anthropic":provider_keyed("anthropic"),"deepseek":provider_keyed("deepseek")},"catalog":MODEL_CATALOG}}))
-            elif path=="/favicon.ico":
-                self._send(404,"")
+            elif path in ("/favicon.ico","/favicon.svg"):
+                self._send(200,FAVICON_SVG,"image/svg+xml")
             else:
                 self._send(200,FRONTEND_HTML,"text/html; charset=utf-8")
         except Exception as e:
@@ -2417,6 +2967,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             except Exception: pass
     def do_POST(self):
         path=urllib.parse.urlparse(self.path).path
+        if not self._gate(path) and path!="/api/auth":
+            self._send(401,json.dumps({"ok":False,"error":"unauthorized","login":True})); return
         try:
             length=int(self.headers.get("Content-Length",0) or 0)
             raw=self.rfile.read(length).decode("utf-8") if length else "{}"
@@ -2424,6 +2976,43 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except Exception:
             self._send(400,json.dumps({"ok":False,"error":"invalid JSON body"})); return
         try:
+            if path=="/api/auth":
+                tok=os.getenv("OPENCLAW_WEB_TOKEN","").strip()
+                if tok and body.get("token","")==tok:
+                    self._send(200,json.dumps({"ok":True}))
+                else:
+                    self._send(401,json.dumps({"ok":False,"error":"wrong or missing token"}))
+                return
+            if path=="/api/schedule":
+                try:
+                    item=scheduler_add(body.get("kind","reminder"),body.get("text",""),int(body.get("in_minutes",0) or 0),int(body.get("repeat_minutes",0) or 0))
+                    self._send(200,json.dumps({"ok":True,"item":item}))
+                except Exception as e:
+                    self._send(400,json.dumps({"ok":False,"error":str(e)}))
+                return
+            if path=="/api/schedule/remove":
+                self._send(200,json.dumps({"ok":scheduler_remove(body.get("id",""))}))
+                return
+            if path=="/api/chats":
+                act=body.get("action","")
+                try:
+                    if act=="new":
+                        self._send(200,json.dumps({"ok":True,"chat":conv_new(body.get("title",""))}))
+                    elif act=="msg":
+                        self._send(200,json.dumps({"ok":True,"chat":conv_save_msg(body.get("id",""),body.get("role","user"),body.get("content",""))}))
+                    elif act=="rename":
+                        self._send(200,json.dumps({"ok":True,"chat":conv_rename(body.get("id",""),body.get("title",""))}))
+                    elif act=="delete":
+                        self._send(200,json.dumps({"ok":conv_delete(body.get("id",""))}))
+                    elif act=="pin":
+                        self._send(200,json.dumps({"ok":True,"chat":conv_pin(body.get("id",""),bool(body.get("pinned",True)))}))
+                    elif act=="move":
+                        self._send(200,json.dumps({"ok":True,"chats":conv_move(body.get("id",""),int(body.get("delta",0) or 0))}))
+                    else:
+                        self._send(400,json.dumps({"ok":False,"error":"unknown action"}))
+                except Exception as e:
+                    self._send(400,json.dumps({"ok":False,"error":str(e)}))
+                return
             if path=="/api/chat":
                 prompt=body.get("prompt","")
                 conv=body.get("conversation","web") or "web"
@@ -2435,6 +3024,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     except Exception as e:
                         self._send(400,json.dumps({"ok":False,"error":str(e)})); return
                 sources=[]
+                _act_off=os.path.getsize(str(ACTIVITY_FILE)) if ACTIVITY_FILE.exists() else 0
                 # Detect web intent in this prompt OR a continuation of a prior
                 # web query (e.g. "has todo tu" after "buscame vuelos...").
                 wi=web_intent(prompt)
@@ -2442,23 +3032,27 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     for h in history[-12:]:
                         if web_intent(str(h.get("content",""))):
                             wi=True; break
-                if wi:
-                    aug=""
-                    try:
-                        res=research(prompt,limit=3,fetch=True)
-                        if res.get("results"):
-                            items=[]
-                            for x in res["results"]:
-                                items.append({"title":x.get("title",""),"url":x.get("url",""),"snippet":(x.get("snippet","") or "")[:300],"content":(x.get("page_text") or "")[:2500]})
-                            sources=[{"title":x.get("title","") or x.get("url",""),"url":x.get("url","")} for x in res["results"] if x.get("url")]
-                            aug=prompt+"\n\nLive web content scraped from the top results. Answer in plain text using this content (cite source URLs); do NOT output code or a plan.\n"+json.dumps(items,ensure_ascii=False)
-                            log_event("chat_web_augmented",results=len(res["results"]))
-                        else:
-                            aug=prompt+"\n\n(Web search returned no live results. Say briefly that live data could not be retrieved.)"
-                    except Exception as e:
-                        log_error("chat_web_augment",e); aug=prompt
-                    result=chat(aug,conv,body.get("system") or "You are a concise research assistant. Answer in plain text from the provided web content only; never output code or a plan.",False,False,model,None,True,history)
+                if mode!="web" and capability_intent(prompt):
+                    # Meta question about OpenClaw's own abilities/browsing:
+                    # answer directly instead of scraping irrelevant pages.
+                    result=chat(prompt,conv,CAPABILITY_SYSTEM,False,False,model,None,True,history)
                     answer=result.get("choices",[{}])[0].get("message",{}).get("content","")
+                elif mode=="web" or wi or extract_urls(prompt):
+                    # Live web research, or fetching the user-supplied URL(s).
+                    try:
+                        aug,srcs,digest=_web_answer_prompt(prompt); sources=srcs
+                        result=chat(aug,conv,WEB_SYSTEM,False,False,model,None,True,history)
+                        answer=result.get("choices",[{}])[0].get("message",{}).get("content","")
+                        # If the model refused or ignored the fetched content, hand back
+                        # a deterministic digest of what was actually found (fast, useful).
+                        if (not answer or _is_refusal(answer)) and digest:
+                            answer=digest
+                            log_event("chat_web_digest_fallback",sources=len(srcs))
+                        log_event("chat_web_augmented",sources=len(srcs),explicit=bool(extract_urls(prompt)),fallback=bool(digest) and (not answer or _is_refusal(answer)))
+                    except Exception as e:
+                        log_error("chat_web_augment",e)
+                        result=chat(prompt,conv,body.get("system"),False,False,model,None,True,history)
+                        answer=result.get("choices",[{}])[0].get("message",{}).get("content","")
                 elif mode=="chat":
                     result=chat(prompt,conv,body.get("system"),False,False,model,None,True,history)
                     answer=result.get("choices",[{}])[0].get("message",{}).get("content","")
@@ -2473,7 +3067,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 else:
                     result=chat(prompt,conv,body.get("system"),False,False,model,None,True,history)
                     answer=result.get("choices",[{}])[0].get("message",{}).get("content","")
-                self._send(200,json.dumps({"ok":True,"answer":answer,"sources":sources,
+                self._send(200,json.dumps({"ok":True,"answer":answer,"sources":sources,"models_used":model_usage_since(_act_off),
                     "model":result.get("_model") if isinstance(result,dict) else None,
                     "provider":result.get("_provider") if isinstance(result,dict) else None,
                     "role":result.get("_role") if isinstance(result,dict) else None}))
@@ -2485,7 +3079,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 result=general_agent(body.get("goal",""),body.get("conversation","agent"),body.get("model"),int(body.get("steps",4)))
                 self._send(200,json.dumps({"ok":True,"answer":result.get("answer",""),"task_id":result.get("task",{}).get("id"),"decision":result.get("task",{}).get("decision"),"status":result.get("task",{}).get("status")}))
             elif path=="/api/agent/queue":
-                item=agent_inbox_add(body.get("goal",""),body.get("conversation","agent"),int(body.get("steps",4)))
+                item=agent_inbox_add(body.get("goal",""),body.get("conversation","agent"),int(body.get("steps",4)),body.get("name",""))
                 self._send(200,json.dumps({"ok":True,"queued":item["id"],"status":"queued"}))
             elif path=="/api/agent/clear":
                 items=_load_inbox(); keep=[x for x in items if x.get("status") in ("queued","running")]; _save_inbox(keep)
@@ -2540,6 +3134,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send(200,json.dumps(todo_del(body.get("id",""))))
             elif path=="/api/agent/retry":
                 self._send(200,json.dumps(agent_inbox_retry(body.get("id",""))))
+            elif path=="/api/agent/delete":
+                self._send(200,json.dumps({"ok":agent_inbox_delete(body.get("id",""))}))
+            elif path=="/api/agent/move":
+                self._send(200,json.dumps({"ok":agent_inbox_move(body.get("id",""),int(body.get("delta",0) or 0))}))
             elif path=="/api/backup":
                 self._send(200,json.dumps(make_backup()))
             elif path=="/api/terminal":
@@ -2675,8 +3273,9 @@ def _result_score(terms, title, snippet, url):
 def _dedupe_results(results):
     seen=set(); out=[]
     for r in results:
-        if r.get("url") and r["url"] not in seen:
-            seen.add(r["url"]); out.append(r)
+        u=(r.get("url") or "").rstrip("/")
+        if u and u.lower() not in seen:
+            seen.add(u.lower()); out.append(r)
     return out
 
 def _clean_html(s):
@@ -2815,6 +3414,11 @@ def browser_search(query, limit=5):
             if _any_specific(results): break
     if terms:
         results.sort(key=lambda r:-_result_score(terms,r.get("title",""),r.get("snippet",""),r.get("url","")))
+        # Drop results that only match filler words / aren't specific to the query,
+        # so engines can't latch onto generic pages. Fall back if filtering empties.
+        strong=_strong_terms(terms) or terms
+        specific=[r for r in results if _is_specific(strong,r.get("title",""),r.get("snippet",""),r.get("url",""))]
+        if specific: results=specific
     ranked=results[:limit]
     log_event("search_completed",query=query,results=len(ranked))
     return ranked
@@ -2878,6 +3482,110 @@ def web_intent(p):
     # time/location cue strongly suggests a lookup.
     if re.search(r"[A-Z][a-z]{2,}",p) and re.search(r"\b(is|are|was|were|did|does|in|at|near|today|now|latest)\b",pl): return True
     return False
+
+_URL_RE = re.compile(r"(?i)https?://[^\s<>\"']+")
+def extract_urls(p):
+    """Pull up to 3 http(s) URLs out of a message."""
+    out=[]
+    for u in _URL_RE.findall(p or ""):
+        u=u.rstrip(".,;:!?)]}<>")
+        if u and u not in out: out.append(u)
+    return out[:3]
+
+_FETCH_VERBS = re.compile(r"\b(read|open|fetch|summarize|summarise|look at|lookup|extract|what('| i)s on|contents? of|this page|that page|the page|the site|the website|check out|visit|go to|explain)\b", re.I)
+def explicit_fetch_intent(p):
+    """True when the message names a URL and asks to read/summarize it."""
+    return bool(extract_urls(p)) and bool(_FETCH_VERBS.search(p or ""))
+
+def capability_intent(p):
+    """True for questions about OpenClaw's own capabilities / internet access,
+    which should be answered directly instead of triggering a live web search."""
+    pl=" "+(p or "").strip().lower()+" "
+    if re.search(r"\b(what can you do|what are you|could you do|whats? your (capabilit|feature|ability)|are you capable of|how do you work|what is openclaw)\b",pl): return True
+    if re.search(r"\b(are you connected to the internet|are you online|do you have internet|do you have (web|internet) access|can you access the (web|internet)|can you search the web)\b",pl): return True
+    if re.search(r"\b(can|do|did|could)\b\s+(you|u)\s+(browse|surf|access the (web|internet)|use the (web|internet)|connect to the internet|go (on|online) the internet)\b",pl): return True
+    return False
+
+CAPABILITY_SYSTEM = (
+    "You are OpenClaw, the local-first AI agent running on this machine. Be friendly and concise. "
+    "If the user is asking what you can do, or whether you can browse the internet, answer directly: "
+    "yes — you CAN search the live web, fetch and summarize specific URLs, and pull current information, "
+    "because you have web-search and URL-fetch tools. Then briefly list your abilities: chat and Q&A; "
+    "persistent memory (MemPalace) to remember and recall facts; local tools to read/write/list files and run "
+    "safe terminal commands; live web research; to-do/notes/reminders; and longer background 'agent' tasks. "
+    "If they want you to look something up, give a concrete example like \"search: today's weather in London\" "
+    "or tell them they can paste a URL for you to summarize. Do NOT claim you lack internet access, and do NOT "
+    "perform a web search right now — only answer about capabilities."
+)
+WEB_SYSTEM = (
+    "You are OpenClaw's web-research assistant. Live web content retrieved just now is provided below. "
+    "Answer the user's request using ONLY that content and cite the source URL(s) for each claim. "
+    "If the content does not contain the answer, say so plainly and suggest how to refine the search or which "
+    "URL to check. Never invent facts, URLs, or details. Use clear, readable text (short paragraphs or bullets)."
+)
+
+def _fetch_web_material(prompt):
+    """Real browsing: fetch an explicit user-supplied URL, otherwise search the
+    web and fetch the top pages (kept small for speed). Returns
+    (items, sources, used_explicit_url)."""
+    urls=extract_urls(prompt)
+    if urls:
+        items=[]; sources=[]
+        for u in urls[:2]:
+            pg=fetch_page(u, max_chars=4500)
+            text=(pg.get("text") or "").strip()
+            if text and not text.startswith("Fetch failed") and not text.startswith("Unsupported content type") and not text.startswith("Fetch error"):
+                items.append({"title":u,"url":u,"content":text})
+                sources.append({"title":u,"url":u})
+        return items, sources, True
+    res=research(prompt, limit=3, fetch=True)
+    items=[]; sources=[]
+    for x in res.get("results", [])[:3]:
+        page=(x.get("page_text") or "").strip() or (x.get("snippet") or "")
+        items.append({"title":x.get("title","") or x.get("url",""),"url":x.get("url",""),
+                      "snippet":(x.get("snippet") or "")[:200],"content":(page or "")[:1600]})
+        if x.get("url"): sources.append({"title":x.get("title","") or x.get("url",""),"url":x.get("url","")})
+    return items, sources, False
+
+_WEB_REFUSE_PHRASES = ("no access to live", "no real-time", "can't check current",
+    "cannot access the internet", "don't have access to live", "no live news",
+    "training data", "knowledge cutoff", "can't browse", "lack internet access",
+    "don't have real-time", "can't pull today", "not connected to the internet")
+def _is_refusal(ans):
+    a=(ans or "").lower()
+    return any(p in a for p in _WEB_REFUSE_PHRASES)
+
+def _web_digest(items):
+    """Deterministic, model-free summary of the fetched items (fallback when the
+    model refuses or produces nothing useful)."""
+    if not items: return ""
+    parts=["Live web results (fetched just now):", ""]
+    for it in items[:6]:
+        title=(it.get("title") or it.get("url") or "Source").strip()
+        url=it.get("url","")
+        text=(it.get("content") or it.get("snippet") or "").strip()
+        snippet=text[:220]
+        if snippet: snippet=" — "+snippet
+        parts.append("• "+title+snippet)
+        if url: parts.append("  "+url)
+    return "\n".join(parts)
+
+def _web_answer_prompt(prompt):
+    items, sources, used_url = _fetch_web_material(prompt)
+    digest=_web_digest(items)
+    if not items:
+        return prompt + "\n\n(Web lookup returned nothing usable. Tell the user you could not retrieve live info and ask them to clarify or supply a URL.)", sources, ""
+    head = ("You ARE connected to the live web and the current, just-fetched content is below. "
+            "NEVER say you lack internet access or real-time browsing. "
+            "Answer the user's request ONLY from that content, cite each source URL, "
+            "and give concrete current details you actually see. If the content is thin, "
+            "report what was found and be honest." if used_url else
+            "You ARE connected to the live web and current search results + page excerpts are below. "
+            "NEVER say you lack internet access or real-time browsing. "
+            "Answer the request ONLY from that content: give today's concrete items/headlines you "
+            "actually see, cite each source URL, and if results are thin say what you found.")
+    joined = "\n\n".join(("SOURCE " + str(i.get("url")) + "\n" + (i.get("content") or "")) for i in items)
+    return prompt + "\n\n" + head + "\n\n" + joined, sources, digest
 
 def complexity_score(p):
     if len(p)>7000 or re.search(r"\b(analyze|debug|architect|prove|compare|research|multi[- ]step|plan)\b",p,re.I): return "reasoning"
@@ -3031,7 +3739,7 @@ def chat(prompt, conversation="default", system=None, stream=False, json_mode=Fa
                 except (ValueError,json.JSONDecodeError): DB.execute("DELETE FROM cache WHERE key=?",(key,)); DB.commit()
         for attempt in range(int(os.getenv("OPENCLAW_RETRIES","2"))+1):
             try:
-                log_event("model_attempt",model=m["name"],attempt=attempt+1)
+                log_event("model_attempt",model=m["name"],attempt=attempt+1,supervisor=call_supervisor)
                 result=request(m,{"model":m["name"],"messages":messages,**call_opts},stream)
                 if not stream: validate_response(result)
                 log_event("model_success",model=m["name"],online_supervisor=call_supervisor,max_tokens=call_token_limit)
@@ -3282,6 +3990,7 @@ def preinstall_cleanup():
     # Close the database before removing its folder so nothing is left half-written.
     try: DB.close()
     except Exception: pass
+    print("Checking for previous OpenClaw versions to remove (moved to Trash)...")
     # 1) Data home + MemPalace memory (everything under OPENCLAW_HOME).
     if ROOT.exists(): wipe(ROOT,"openclaw data + memory ("+str(ROOT)+")")
     # 2) Legacy ~/.openclaw install.
@@ -3302,6 +4011,10 @@ def preinstall_cleanup():
                 wipe(cand,"old Desktop folder "+cand.name)
     for label in removed: print("Deleted:",label)
     for label,err in failed: print("Could not delete",label,":",err)
+    if not removed and not failed:
+        print("No previous OpenClaw versions found to remove (clean start).")
+    elif removed:
+        print(f"Removed {len(removed)} previous OpenClaw item(s) -> Trash.")
     # Recreate an empty home so the fresh install has somewhere to write.
     try: ROOT.mkdir(parents=True,exist_ok=True)
     except Exception: pass
@@ -3402,7 +4115,7 @@ def settings_status():
 
 def apply_settings(data):
     if not isinstance(data,dict): raise ValueError("settings must be a JSON object")
-    allowed=set(("OPENAI_API_KEY","OPENAI_MODEL","OPENAI_BASE_URL","ANTHROPIC_API_KEY","ANTHROPIC_MODEL","ANTHROPIC_BASE_URL","DEEPSEEK_API_KEY","DEEPSEEK_MODEL","DEEPSEEK_BASE_URL","LOCAL_URL","LOCAL_MODEL","LOCAL_KEY","LOCAL_CONTEXT_WINDOW"))|PRESET_KEYS
+    allowed=set(("OPENAI_API_KEY","OPENAI_MODEL","OPENAI_BASE_URL","ANTHROPIC_API_KEY","ANTHROPIC_MODEL","ANTHROPIC_BASE_URL","DEEPSEEK_API_KEY","DEEPSEEK_MODEL","DEEPSEEK_BASE_URL","LOCAL_URL","LOCAL_MODEL","LOCAL_KEY","LOCAL_CONTEXT_WINDOW","OPENCLAW_WEB_TOKEN"))|PRESET_KEYS
     changed=[]
     for k in allowed:
         v=data.get(k)
@@ -3551,6 +4264,51 @@ def system_resources():
     bt=_boot_time_stdlib()
     if bt: info["uptime_seconds"]=int(time.time()-bt)
     return info
+
+def detect_local_servers(timeout=0.7):
+    """Probe well-known local OpenAI-compatible endpoints and return which are
+    reachable plus the model ids each server is currently serving (Ollama, LM
+    Studio, vLLM, llama.cpp, and common local dev ports). Pure stdlib."""
+    import concurrent.futures as _cf
+    base_pts = [
+        ("Ollama",       "http://127.0.0.1:11434/v1", "ollama"),
+        ("LM Studio",    "http://127.0.0.1:1234/v1",   "lmstudio"),
+        ("vLLM",         "http://127.0.0.1:8000/v1",   "vllm"),
+        ("llama.cpp",    "http://127.0.0.1:8080/v1",   "llamacpp"),
+        ("Local :5000",  "http://127.0.0.1:5000/v1",   "generic"),
+        ("Local :3001",  "http://127.0.0.1:3001/v1",   "generic"),
+    ]
+    def _probe(pt):
+        name, url, kind = pt
+        models = []
+        # 1) Standard OpenAI-compatible /models on THIS endpoint only.
+        try:
+            req = urllib.request.Request(url.rstrip("/") + "/models")
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                data = json.loads(r.read().decode("utf-8"))
+            for m in (data.get("data") or []):
+                mid = m.get("id")
+                if mid and mid not in models: models.append(mid)
+        except Exception:
+            pass
+        # 2) Ollama native /api/tags only for the Ollama endpoint.
+        if kind == "ollama":
+            try:
+                req = urllib.request.Request("http://127.0.0.1:11434/api/tags")
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    data = json.loads(r.read().decode("utf-8"))
+                for m in (data.get("models") or []):
+                    mid = m.get("name") or m.get("model")
+                    if mid and mid not in models: models.append(mid)
+            except Exception:
+                pass
+        return {"name": name, "kind": kind, "url": url, "reachable": bool(models), "models": models[:200]}
+    seen = {}
+    with _cf.ThreadPoolExecutor(max_workers=len(base_pts)) as ex:
+        for res in ex.map(_probe, base_pts):
+            if res["reachable"]:
+                seen.setdefault(res["url"], res)
+    return list(seen.values())
 
 def setup_menu():
     """Interactive first-run menu: enter API keys / configure a local endpoint."""
@@ -3705,26 +4463,120 @@ def desktop_all_in_one():
         skipped.append({"name":"openclaw-data","error":"OPENCLAW_HOME does not exist"})
     return {"folder":str(dest),"items":added,"skipped":skipped}
 
+def _png_bytes(w, h, rgba_row):
+    import zlib, struct
+    def chunk(t, d):
+        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+    sig = b"\x89PNG\r\n\x1a\n"
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0)
+    raw = b"".join(b"\x00" + bytes(rgba_row(y)) for y in range(h))
+    return sig + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b"")
+
+def _build_start_app(desktop, bundle):
+    """Create Desktop/Start OpenClaw.app only. It opens a Terminal that runs the
+    app's own internal launch script (starts serve + auto-opens the web), so it
+    is fully self-contained — no separate .command file is generated."""
+    import stat
+    try:
+        app = desktop / "Start OpenClaw.app"
+        macos = app / "Contents" / "MacOS"
+        res = app / "Contents" / "Resources"
+        macos.mkdir(parents=True, exist_ok=True); res.mkdir(parents=True, exist_ok=True)
+        launch = res / "launch.command"
+        data = bundle / "openclaw-data"
+        try: data.mkdir(parents=True, exist_ok=True)
+        except Exception: pass
+        script = bundle / "openclaw-one.sh"
+        launch.write_text(
+            "#!/bin/bash\n"
+            "# OpenClaw launch (self-contained, generated by install)\n"
+            f'export OPENCLAW_HOME="{data}"\n'
+            f'cd "{bundle}"\n'
+            f'exec "{script}" serve\n', encoding="utf-8")
+        os.chmod(str(launch), 0o755)
+        exe = macos / "launcher"
+        exe.write_text(
+            "#!/bin/bash\n"
+            f'exec open -a Terminal "{launch}"\n', encoding="utf-8")
+        os.chmod(str(exe), 0o755)
+        info_icon = "AppIcon"
+        icon_ok = False
+        try:
+            import subprocess as _sp, tempfile, shutil
+            with tempfile.TemporaryDirectory() as td:
+                base_png = Path(td) / "base.png"
+                # gradient dark->accent diagonal
+                def row(y):
+                    out = []
+                    for x in range(1024):
+                        t = (x + y) / 2048.0
+                        r = int(11 + (91 - 11) * t); g = int(15 + (140 - 15) * t); b = int(26 + (245 - 26) * t)
+                        out += [r, g, b, 255]
+                    return out
+                base_png.write_bytes(_png_bytes(1024, 1024, row))
+                ic = Path(td) / "AppIcon.iconset"; ic.mkdir()
+                sizes = [(16, "icon_16x16.png"), (32, "icon_16x16@2x.png"),
+                         (32, "icon_32x32.png"), (64, "icon_32x32@2x.png"),
+                         (128, "icon_128x128.png"), (256, "icon_128x128@2x.png"),
+                         (256, "icon_256x256.png"), (512, "icon_256x256@2x.png"),
+                         (512, "icon_512x512.png"), (1024, "icon_512x512@2x.png")]
+                for px, name in sizes:
+                    _sp.run(["sips", "-z", str(px), str(px), str(base_png), "--out", str(ic / name)],
+                            capture_output=True, timeout=60)
+                icns = Path(td) / "AppIcon.icns"
+                _sp.run(["iconutil", "-c", "icns", str(ic), "-o", str(icns)],
+                        capture_output=True, timeout=60)
+                if icns.exists():
+                    shutil.copy2(str(icns), str(res / "AppIcon.icns")); icon_ok = True
+        except Exception:
+            pass
+        if not icon_ok:
+            info_icon = ""
+        plist = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+            '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+            '<plist version="1.0"><dict>\n'
+            '<key>CFBundleExecutable</key><string>launcher</string>\n'
+            '<key>CFBundleIdentifier</key><string>com.openclaw.start</string>\n'
+            '<key>CFBundleName</key><string>Start OpenClaw</string>\n'
+            '<key>CFBundleDisplayName</key><string>Start OpenClaw</string>\n'
+            '<key>CFBundlePackageType</key><string>APPL</string>\n'
+            '<key>CFBundleVersion</key><string>1.0</string>\n'
+            '<key>CFBundleShortVersionString</key><string>1.0</string>\n'
+            '<key>LSUIElement</key><true/>\n')
+        if info_icon:
+            plist += '<key>CFBundleIconFile</key><string>AppIcon</string>\n'
+        plist += '</dict></plist>\n'
+        (app / "Contents" / "Info.plist").write_text(plist, encoding="utf-8")
+        try: os.chmod(str(app / "Contents" / "Info.plist"), 0o644)
+        except Exception: pass
+        # Drop quarantine so double-click works without a security prompt (best effort).
+        try:
+            subprocess.run(["xattr", "-dr", "com.apple.quarantine", str(app)],
+                           capture_output=True, timeout=20)
+        except Exception: pass
+        return app
+    except Exception as e:
+        log_error("build_start_app", e); return None
+
 def create_start_icon(bundle_folder):
-    """Put a double-clickable 'Start OpenClaw.command' on the Desktop that
-    launches the self-contained copy inside bundle_folder (its own data home)."""
+    """Generate a Desktop launcher for the self-contained copy inside bundle_folder.
+    Creates ONLY 'Start OpenClaw.app' (self-contained, with icon, opens the web on
+    double-click). Removes any previously generated 'Start OpenClaw.command'."""
     import stat
     bundle=Path(bundle_folder).expanduser().resolve()
-    icon=Path.home()/"Desktop"/"Start OpenClaw.command"
-    data=bundle/"openclaw-data"
-    script=bundle/"openclaw-one.sh"
-    try: data.mkdir(parents=True,exist_ok=True)
+    desktop=Path.home()/"Desktop"
+    # Remove the older .command so we only ship the app.
+    old=desktop/"Start OpenClaw.command"
+    try:
+        if old.exists(): old.unlink()
     except Exception: pass
-    icon.write_text(
-        "#!/bin/bash\n"
-        "# OpenClaw launcher (generated by install)\n"
-        f'export OPENCLAW_HOME="{data}"\n'
-        f'cd "{bundle}"\n'
-        f'exec "{script}" repl\n',
-        encoding="utf-8")
-    try: os.chmod(str(icon),0o755)
-    except Exception: pass
-    return icon
+    app=None
+    if sys.platform=="darwin":
+        try: app=_build_start_app(desktop, bundle)
+        except Exception as e: log_error("start_app",e)
+    return {"command":None,"app":app}
 
 # ============================================================================
 # Communications / messaging connectors (Telegram two-way, Slack & Discord out)
@@ -3939,7 +4791,9 @@ def ensure_comms():
         if _comms_started: return
         try:
             threading.Thread(target=comms_daemon, daemon=True).start()
+            threading.Thread(target=scheduler_worker, daemon=True).start()
             _comms_started = True
+            log_event("background_services_started")
         except Exception as e:
             log_error("comms_start", e)
 
@@ -4037,8 +4891,216 @@ def register_requested_model(name):
     clone = dict(base); clone["name"] = name; clone.pop("_model", None)
     MODELS.append(clone)
 
+# ---------------------------------------------------------------------------
+# Scheduler: delayed / repeating reminders and background agent goals.
+# ---------------------------------------------------------------------------
+SCHED_FILE = ROOT / "schedule.json"
+_sched_lock = threading.Lock()
+
+def _load_schedule():
+    with _sched_lock:
+        try:
+            if SCHED_FILE.exists():
+                st = json.loads(SCHED_FILE.read_text(encoding="utf-8"))
+                if isinstance(st, list): return st
+        except Exception:
+            pass
+        return []
+
+def _save_schedule(items):
+    with _sched_lock:
+        try: SCHED_FILE.write_text(json.dumps(items, ensure_ascii=False), encoding="utf-8")
+        except Exception as e: log_error("schedule_save", e)
+
+def scheduler_add(kind, text, in_minutes=0, repeat_minutes=0, conversation="agent", steps=4):
+    kind = "reminder" if kind not in ("agent", "reminder") else kind
+    in_minutes = max(0, int(in_minutes or 0)); repeat_minutes = max(0, int(repeat_minutes or 0))
+    if not (text or "").strip(): raise ValueError("text is required")
+    item = {"id": str(uuid.uuid4()), "kind": kind, "text": text.strip(),
+            "due": int(time.time()) + in_minutes * 60, "repeat": repeat_minutes * 60,
+            "conversation": conversation, "steps": int(steps) or 4,
+            "created": int(time.time()), "fired": False}
+    items = _load_schedule(); items.append(item); _save_schedule(items)
+    log_event("schedule_added", kind=kind, text=text[:200], due=item["due"], repeat=repeat_minutes)
+    return item
+
+def scheduler_remove(sid):
+    items = _load_schedule(); keep = [x for x in items if x.get("id") != sid]
+    _save_schedule(keep); log_event("schedule_removed", id=sid); return len(items) != len(keep)
+
+def scheduler_list():
+    items = _load_schedule(); now = int(time.time())
+    for x in items:
+        x["in_secs"] = max(0, int(x.get("due", now)) - now)
+    items.sort(key=lambda x: x.get("due", 0))
+    upcoming = [x for x in items if not x.get("fired")][:100]
+    return {"count": len(upcoming), "items": upcoming}
+
+def _fire_scheduled(item):
+    kind = item.get("kind", "reminder"); text = (item.get("text") or "").strip()
+    if kind == "agent":
+        try:
+            queued = agent_inbox_add(text, item.get("conversation", "agent"), int(item.get("steps", 4)))
+            log_event("scheduled_agent_fired", id=item.get("id"), task_id=queued["id"])
+            comms_task_notify("queued", "Scheduled agent goal started", text)
+        except Exception as e:
+            log_error("scheduled_agent", e)
+    else:
+        log_event("scheduled_reminder_fired", id=item.get("id"), text=text[:300])
+        comms_notify_reminder("⏰ Reminder", text)
+
+def scheduler_worker():
+    while True:
+        try:
+            now = int(time.time()); items = _load_schedule(); due = [x for x in items if not x.get("fired") and int(x.get("due", 0)) <= now]
+            if due:
+                for it in due:
+                    _fire_scheduled(it)
+                keep = []
+                for x in items:
+                    if x.get("id") in {d.get("id") for d in due}:
+                        if x.get("repeat"): x["due"] = now + int(x["repeat"]); x["fired"] = False; keep.append(x)
+                    else:
+                        keep.append(x)
+                _save_schedule(keep)
+        except Exception as e:
+            log_error("scheduler_worker", e)
+        time.sleep(10)
+
+# ---------------------------------------------------------------------------
+# Task/reminder notifications over configured connectors.
+# ---------------------------------------------------------------------------
+def _comms_any_configured():
+    return bool((os.getenv("TELEGRAM_BOT_TOKEN", "").strip() and os.getenv("TELEGRAM_ALLOWED_IDS", "").strip())
+                or os.getenv("SLACK_WEBHOOK_URL", "").strip() or os.getenv("DISCORD_WEBHOOK_URL", "").strip())
+
+def comms_task_notify(status, title, detail=""):
+    if os.getenv("OPENCLAW_TASK_NOTIFY", "1") == "0": return
+    if not _comms_any_configured(): return
+    icon = {"done": "✅", "failed": "⚠️", "queued": "📌", "running": "▶️", "finished": "✅"}.get(status, "🔔")
+    text = f"{icon} OpenClaw task {status}: {title}"
+    if detail: text += "\n" + (detail or "")[:1500]
+    try:
+        r = comms_notify_all(text)
+        log_event("task_notify_sent", status=status)
+    except Exception as e:
+        log_error("task_notify", e)
+
+def comms_notify_reminder(title, text):
+    if not _comms_any_configured(): return
+    try:
+        comms_notify_all(f"{title}\n{text[:1500]}")
+        log_event("reminder_notify_sent")
+    except Exception as e:
+        log_error("reminder_notify", e)
+
+# ---------------------------------------------------------------------------
+# Chat history: named conversations persisted to conversations.json.
+# ---------------------------------------------------------------------------
+CONV_FILE = ROOT / "conversations.json"
+_conv_lock = threading.Lock()
+
+def _load_convs():
+    with _conv_lock:
+        try:
+            if CONV_FILE.exists():
+                d = json.loads(CONV_FILE.read_text(encoding="utf-8"))
+                if isinstance(d, list): return d
+        except Exception:
+            pass
+    return []
+
+def _save_convs(cs):
+    with _conv_lock:
+        try: CONV_FILE.write_text(json.dumps(cs, ensure_ascii=False), encoding="utf-8")
+        except Exception as e: log_error("conv_save", e)
+
+def _conv_meta(c):
+    msgs = c.get("messages") or []
+    return {"id": c.get("id"), "title": c.get("title") or "New chat",
+            "created": c.get("created"), "updated": c.get("updated"),
+            "pinned": bool(c.get("pinned")), "count": len(msgs),
+            "last": (msgs[-1].get("content", "")[:80] if msgs else "")}
+
+def _conv_index(cs, cid):
+    for i, c in enumerate(cs):
+        if c.get("id") == cid: return i
+    return -1
+
+def conv_list():
+    # Preserve stored (manually ordered) order; pin moves a chat to the front.
+    return [_conv_meta(c) for c in _load_convs()]
+
+def conv_new(title=""):
+    cs = _load_convs()
+    c = {"id": str(uuid.uuid4()), "title": (title or "").strip() or "New chat",
+         "created": int(time.time()), "updated": int(time.time()), "pinned": False, "messages": []}
+    cs.insert(0, c); _save_convs(cs); log_event("conv_new", id=c["id"], title=c["title"])
+    return _conv_meta(c)
+
+def conv_get(cid):
+    cs = _load_convs(); i = _conv_index(cs, cid)
+    if i < 0: raise ValueError("conversation not found")
+    return {"meta": _conv_meta(cs[i]), "messages": cs[i].get("messages") or []}
+
+def conv_save_msg(cid, role, content):
+    role = "assistant" if role == "assistant" else "user"
+    content = (content or "").strip()
+    if not content: raise ValueError("empty message")
+    cs = _load_convs(); i = _conv_index(cs, cid)
+    if i < 0: raise ValueError("conversation not found")
+    c = cs[i]
+    if c.get("title") in (None, "", "New chat") and role == "user":
+        c["title"] = content[:60]
+    msgs = c.setdefault("messages", [])
+    msgs.append({"role": role, "content": content, "ts": int(time.time())})
+    if len(msgs) > 500: c["messages"] = msgs[-500:]
+    c["updated"] = int(time.time()); _save_convs(cs)
+    return _conv_meta(c)
+
+def conv_rename(cid, title):
+    cs = _load_convs(); i = _conv_index(cs, cid)
+    if i < 0: raise ValueError("conversation not found")
+    cs[i]["title"] = (title or "").strip() or "New chat"; _save_convs(cs)
+    return _conv_meta(cs[i])
+
+def conv_delete(cid):
+    cs = _load_convs(); keep = [c for c in cs if c.get("id") != cid]
+    _save_convs(keep); log_event("conv_delete", id=cid); return len(keep) != len(cs)
+
+def conv_pin(cid, pinned):
+    cs = _load_convs(); i = _conv_index(cs, cid)
+    if i < 0: raise ValueError("conversation not found")
+    cs[i]["pinned"] = bool(pinned)
+    if pinned and i != 0:
+        c = cs.pop(i); cs.insert(0, c)
+    _save_convs(cs)
+    j = _conv_index(cs, cid)
+    return _conv_meta(cs[j])
+
+def conv_move(cid, delta):
+    cs = _load_convs(); i = _conv_index(cs, cid)
+    if i < 0: raise ValueError("conversation not found")
+    j = i + int(delta or 0)
+    if 0 <= j < len(cs):
+        cs[i], cs[j] = cs[j], cs[i]; _save_convs(cs)
+    return conv_list()
+
 def main():
     daily_learn()
+    if len(sys.argv) < 2:
+        print("OpenClaw " + VERSION + " — hybrid AI gateway with MemPalace memory")
+        print("No command given, so here are some ways to run it:")
+        print("  openclaw-one.sh repl              interactive chat (no command = this)")
+        print('  openclaw-one.sh chat "your msg"   one-shot chat')
+        print("  openclaw-one.sh serve             web Control Center + background daemon")
+        print("  openclaw-one.sh install           install checklist / auto-fix")
+        print('  openclaw-one.sh memory add "..."  remember something')
+        print("  openclaw-one.sh --help            all commands\n")
+        if sys.stdin.isatty():
+            print("Starting interactive session (type /exit or Ctrl-D to quit)...\n")
+            repl()
+        return
     p=argparse.ArgumentParser(description="OpenClaw hybrid gateway with MemPalace")
     s=p.add_subparsers(dest="cmd",required=True)
     c=s.add_parser("chat"); c.add_argument("prompt"); c.add_argument("--conversation",default="default"); c.add_argument("--system"); c.add_argument("--model"); c.add_argument("--stream",action="store_true"); c.add_argument("--json",action="store_true")
@@ -4137,7 +5199,10 @@ def main():
             print(f"[ done ] All-in-one folder created on Desktop: {pkg['folder']}")
             if pkg.get("skipped"): print("[ warn ] Some files were skipped:",pkg["skipped"])
             icon=create_start_icon(pkg["folder"])
-            print(f"[ done ] Start icon created on Desktop: {icon}")
+            if icon.get("app"):
+                print(f"[ done ] Start OpenClaw.app created (double-click to auto-open the web): {icon['app']}")
+            else:
+                print("[ note ] Desktop launcher could not be created on this platform.")
         print("Starting OpenClaw services (web + background agent)...")
         try:
             started=run_all(os.getenv("OPENCLAW_WEB_PORT","8765"))
