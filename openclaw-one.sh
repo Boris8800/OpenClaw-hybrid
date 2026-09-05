@@ -1321,6 +1321,21 @@ body.light pre,body.light textarea,body.light input,body.light select{color:#1c2
 .toast{display:flex;align-items:center;gap:10px}
 .toast .t-x{margin-left:auto;cursor:pointer;opacity:.7;font-weight:700}
 .toast .t-x:hover{opacity:1}
+/* Live browsing viewer: shows the ACTUAL page the agent is fetching */
+.livepanel{position:fixed;right:16px;bottom:16px;width:min(520px,94vw);height:min(70vh,560px);display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--line);border-top:3px solid var(--accent2);border-radius:12px;box-shadow:var(--shadow);z-index:70;overflow:hidden}
+.livepanel-hd{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--line);font-weight:700;font-size:0.786rem;color:var(--accent2);text-transform:uppercase;letter-spacing:.6px;flex:0 0 auto}
+.livepanel-hd .dotp{width:8px;height:8px;border-radius:50%;background:var(--ok);animation:pulse 1.1s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+.livepanel-hd .lx{margin-left:auto;background:none;border:0;color:var(--txt);font-size:1.1rem;line-height:1;cursor:pointer;padding:2px 6px;border-radius:6px}
+.livepanel-hd .lx:hover{background:rgba(251,113,133,.15);color:var(--bad)}
+.liveurl{font-size:0.7rem;color:var(--muted);text-transform:none;letter-spacing:0;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;direction:rtl;text-align:left}
+.live-actions{display:flex;gap:4px;margin-left:auto;align-items:center}
+.live-actions button{background:none;border:1px solid var(--line);color:var(--muted);border-radius:6px;padding:1px 7px;cursor:pointer;font-size:0.72rem}
+.live-actions button:hover{color:var(--accent2);border-color:var(--accent)}
+.liveframe-box{position:relative;flex:1 1 auto;min-height:0;background:#fff}
+.liveframe{width:100%;height:100%;border:0;background:#fff}
+.live-note{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;padding:16px;color:var(--muted);font-size:0.857rem;line-height:1.6;background:var(--panel2)}
+.live-note.hidden{display:none}
 /* Chat list tabs */
 .chattabs{display:flex;gap:8px;overflow-x:auto;padding:2px 0 4px;align-items:center}
 .chattab{flex:0 0 auto;display:inline-flex;align-items:center;gap:7px;max-width:230px;background:var(--panel2);border:1px solid var(--line);color:var(--muted);border-radius:20px;padding:6px 12px;font-size:0.857rem;cursor:pointer;transition:background .12s,color .12s,border-color .12s;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -1681,6 +1696,21 @@ body.light pre,body.light textarea,body.light input,body.light select{color:#1c2
   </div>
 </div>
 
+<!-- Live browsing viewer: shows the actual page the agent is fetching -->
+<div class="livepanel" id="live-panel" hidden>
+  <div class="livepanel-hd"><span class="dotp"></span>Agent browsing
+    <span class="liveurl" id="live-url">…</span>
+    <div class="live-actions">
+      <button type="button" id="live-open" title="Open in a new tab">open</button>
+      <button class="lx" data-live-close type="button" title="Close" onclick="event.preventDefault();event.stopPropagation();var p=document.getElementById('live-panel');if(p)p.hidden=true;window._liveOpened=true;">✕</button>
+    </div>
+  </div>
+  <div class="liveframe-box">
+    <div class="live-note" id="live-note">Waiting for the agent to open a webpage…<br>Switch to <b>Web research</b> and ask something.</div>
+    <iframe class="liveframe" id="live-frame" sandbox="allow-scripts allow-same-origin allow-popups" referrerpolicy="no-referrer"></iframe>
+  </div>
+</div>
+
 <!-- Preset settings modal -->
 <div class="modal" id="preset-modal">
   <div class="modal-backdrop" id="preset-backdrop"></div>
@@ -1715,6 +1745,14 @@ async function api(path,opts){
   let j={};try{j=await r.json()}catch(e){j={}}
   if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j}
 const post=(path,body)=>api(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+/* Close the live viewer from anywhere (works regardless of later code). */
+document.addEventListener('click',function(e){
+  var c=e.target&&e.target.closest?e.target.closest('[data-live-close]'):null;
+  if(c){e.preventDefault();e.stopPropagation();var p=document.getElementById('live-panel');if(p)p.hidden=true;window._liveOpened=true;}
+});
+document.addEventListener('keydown',function(e){
+  if(e.key==='Escape'){var p=document.getElementById('live-panel');if(p)p.hidden=true;window._liveOpened=true;}
+});
 
 /* navigation */
 const TITLES={overview:'Overview',chat:'Chat',agent:'Agent Manager',memory:'Memory',tools:'Tools',terminal:'Terminal',system:'System',settings:'Settings'};
@@ -1974,6 +2012,7 @@ async function sendChat(){
   setRunning(true);showWorkChip('working');
   const ac=new AbortController();window._ocAbort=ac;
   window._tkTimer=setInterval(()=>{const e=$('#tk-elapsed');if(e){const s=((performance.now()-t0)/1000).toFixed(1);e.textContent='elapsed '+s+'s · '+label+' · press ■ to stop';}},300);
+  window._liveOpened=false;
   window._liveTimer=setInterval(liveTick,900);
   const clearTimers=()=>{clearInterval(window._tkTimer);window._tkTimer=null;if(window._liveTimer){clearInterval(window._liveTimer);window._liveTimer=null;}liveDone();const il=$('#tk-live');if(il)il.innerHTML='';};
   try{
@@ -2101,38 +2140,49 @@ function startVoice(){
   rec.start();chatStatus('🎤 listening…');
 }
 
-/* live working status: shows a tiny inline chip + inline lines while a turn runs */
-const _SHORT={'search_started':'searching','search_completed':'results','page_fetch_started':'fetching','page_fetch_completed':'page','chat_web_augmented':'sources','model_attempt':'thinking'};
-const _LIVE_ICON={'search_started':'🔎 searching the web…','search_completed':'✓ got search results','page_fetch_started':'↓ fetching page','page_fetch_completed':'✓ read page','chat_web_augmented':'🧠 building answer from sources','model_attempt':'🤖 asking model'};
-const _BROWSE={'search_started':1,'search_completed':1,'page_fetch_started':1,'page_fetch_completed':1,'chat_web_augmented':1};
+/* live page viewer: opens when the agent browses and shows the ACTUAL page it is on */
+const _SHORT={'search_started':'searching','search_completed':'results','page_fetch_started':'fetching','page_fetch_completed':'reading','chat_web_augmented':'sources','model_attempt':'thinking'};
 function showWorkChip(w){const c=$('#workchip');if(c){c.style.display='';$('#workword').textContent=w||'working';}}
 function hideWorkChip(){const c=$('#workchip');if(c)c.style.display='none';}
-function liveLine(e){
-  const ic=_LIVE_ICON[e.event];if(!ic)return null;
-  let extra='';
-  if(e.event==='page_fetch_started'||e.event==='page_fetch_completed')extra=' '+(e.url||'');
-  else if(e.event==='search_completed')extra=' ('+(e.results||'?')+' results)';
-  else if(e.event==='model_attempt')extra=' '+(e.model||'');
-  else if(e.event==='search_started')extra=' '+((e.query||''));
-  return ic+extra;
+window._liveCurUrl='';
+function openLivePanel(){const p=$('#live-panel');if(p)p.hidden=false;}
+function closeLivePanel(){const p=$('#live-panel');if(p)p.hidden=true;window._liveOpened=true;hideWorkChip();}
+window.closeLivePanel=closeLivePanel;
+document.addEventListener('keydown',function(e){if(e.key==='Escape'){const p=document.getElementById('live-panel');if(p&&!p.hidden)closeLivePanel();}});
+$('#live-open').addEventListener('click',function(){if(window._liveCurUrl)window.open(window._liveCurUrl,'_blank','noopener');});
+function showLivePage(u){
+  if(!u)return;
+  const un=$('#live-note');if(un)un.classList.add('hidden');
+  const url=$('#live-url');if(url)url.textContent=u;
+  window._liveCurUrl=u;
+  const fr=$('#live-frame');
+  if(fr&&fr.src!==u){fr.src=u;}
 }
 async function liveTick(){
   try{
-    const j=await api('/api/events?limit=120');const evs=(j.events||[]);
-    let last=null;for(const e of evs){ if(_LIVE_ICON[e.event])last=e; }
+    const j=await api('/api/events?limit=150');const evs=(j.events||[]);
+    let last=null;for(const e of evs){ if(_SHORT[e.event])last=e; }
     if(last){const w=_SHORT[last.event];if(w)showWorkChip(w);}
     const seen=window._liveSeen||(window._liveSeen=new Set());
-    const frag=[];
     for(const e of evs){
       const key=(e.time||'')+'|'+(e.event||'')+'|'+(e.url||e.results||e.model||e.query||'');
       if(seen.has(key))continue;
       seen.add(key);
-      const ln=liveLine(e);if(ln)frag.push(ln);
+      if((e.event==='page_fetch_started'||e.event==='page_fetch_completed')&&e.url){
+        if(!window._liveOpened){window._liveOpened=true;openLivePanel();}
+        showLivePage(e.url);
+      } else if(e.event==='search_started'&&!window._liveOpened){
+        window._liveOpened=true;openLivePanel();
+      }
     }
-    if(frag.length){const il=$('#tk-live');if(il){il.style.display='block';il.innerHTML+=frag.map(esc).join('<br>');}}
   }catch(e){}
 }
-function liveDone(){hideWorkChip();}
+function liveDone(){
+  hideWorkChip();
+  const un=$('#live-note');
+  if(un&&!un.classList.contains('hidden'))un.innerHTML='✓ finished';
+  // keep the page visible so the user can review it; it is closable with X/Esc
+}
 async function seedLiveSeen(){
   try{
     const j=await api('/api/events?limit=150');const s=new Set();
@@ -3983,6 +4033,16 @@ def preinstall_cleanup():
     try: DB.close()
     except Exception: pass
     print("Checking for previous OpenClaw versions to remove (moved to Trash)...")
+    # 0) Stop any still-running OpenClaw web servers from older versions so they
+    #    can't keep serving stale code after the install.
+    try:
+        if sys.platform.startswith("darwin") or sys.platform.startswith("linux"):
+            subprocess.run(["pkill","-f","openclaw-one.sh serve"],capture_output=True,timeout=15)
+        elif sys.platform.startswith("win"):
+            subprocess.run(["taskkill","/F","/FI","WINDOWTITLE eq OpenClaw*"],capture_output=True,timeout=15)
+    except Exception: pass
+    try: time.sleep(1)
+    except Exception: pass
     # 1) Data home + MemPalace memory (everything under OPENCLAW_HOME).
     if ROOT.exists(): wipe(ROOT,"openclaw data + memory ("+str(ROOT)+")")
     # 2) Legacy ~/.openclaw install.
@@ -3995,12 +4055,25 @@ def preinstall_cleanup():
             r=subprocess.run([pip,"uninstall","-y","openclaw"],capture_output=True,text=True,timeout=120)
             if r.returncode==0: removed.append("pip openclaw package")
         except Exception: pass
-    # 4) Old dated all-in-one Desktop folders.
+    # 4) Old dated all-in-one Desktop folders + leftover launcher from older installs.
     desktop=Path.home()/"Desktop"
     if desktop.is_dir():
         for cand in sorted(desktop.iterdir()):
             if cand.is_dir() and re.match(r"^OpenClaw\(.*\)$",cand.name):
                 wipe(cand,"old Desktop folder "+cand.name)
+        old_cmd=desktop/"Start OpenClaw.command"
+        if old_cmd.exists():
+            try: old_cmd.unlink(); removed.append("old Start OpenClaw.command")
+            except Exception as e: failed.append(("old Start OpenClaw.command",str(e)))
+        old_app=desktop/"Start OpenClaw.app"
+        if old_app.exists():
+            wipe(old_app,"old Start OpenClaw.app (recreated by this install)")
+    # 5) Any older dated OpenClaw bundles elsewhere under the user's home (not the
+    #    running source folder, which wipe() refuses to delete).
+    home=Path.home()
+    for cand in sorted(home.iterdir()):
+        if cand.is_dir() and re.match(r"^OpenClaw\(.*\)$",cand.name):
+            wipe(cand,"old folder "+str(cand))
     for label in removed: print("Deleted:",label)
     for label,err in failed: print("Could not delete",label,":",err)
     if not removed and not failed:
@@ -5195,17 +5268,18 @@ def main():
         print_doctor(res)
         if not res["all_ok"]:
             print("\n[ warn ] Installation finished with issues (you can still start OpenClaw, but set a model later to use AI features).\n")
-        pkg=desktop_all_in_one()
-        if "error" in pkg:
-            print("[ warn ] Could not create Desktop all-in-one folder:",pkg["error"])
-        else:
-            print(f"[ done ] All-in-one folder created on Desktop: {pkg['folder']}")
-            if pkg.get("skipped"): print("[ warn ] Some files were skipped:",pkg["skipped"])
-            icon=create_start_icon(pkg["folder"])
-            if icon.get("app"):
-                print(f"[ done ] Start OpenClaw.app created (double-click to auto-open the web): {icon['app']}")
+        # Self-contained: no dated Desktop bundle or code copies. The launcher
+        # points straight at THIS installer folder, so it always runs the file
+        # being edited here. (preinstall_cleanup already removes older dated bundles.)
+        try:
+            here=Path(os.path.abspath(__file__)).resolve().parent
+            icon=create_start_icon(here)
+            if icon and icon.get("app"):
+                print(f"[ done ] Start OpenClaw.app runs this folder: {icon['app']}")
             else:
-                print("[ note ] Desktop launcher could not be created on this platform.")
+                print("[ note ] Could not create a launcher on this platform.")
+        except Exception as e:
+            print("[ note ] Launcher step skipped:",e)
         port=os.getenv("OPENCLAW_WEB_PORT","8765")
         print("Starting OpenClaw web service (keeps running in the background)...")
         if spawn_service(port):
