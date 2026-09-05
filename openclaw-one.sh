@@ -1732,8 +1732,8 @@ const $=s=>document.querySelector(s);
 const esc=t=>String(t).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 function fmtText(t){
   let s=esc(t);
-  s=s.replace(/(https?:\/\/[^\s<>"']+)/g,'<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>');
-  s=s.replace(/(^|[\s(])(www\.[^\s<>"']+)/g,'$1<a href="http://$2" target="_blank" rel="noopener noreferrer">$2</a>');
+  s=s.replace(/(https?:\\x2f\\x2f[^\\s<>"']+)/g,'<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>');
+  s=s.replace(/(^|[\\s(])(www\\.[^\\s<>"']+)/g,'$1<a href="http:\\x2f\\x2f$2" target="_blank" rel="noopener noreferrer">$2</a>');
   return s;
 }
 function toast(msg,err){const t=$('#toast');t.innerHTML=esc(msg)+'<span class="t-x" data-x>×</span>';t.className='toast show'+(err?' err':'');clearTimeout(t._h);t._h=setTimeout(()=>t.className='toast',2600)}
@@ -2235,6 +2235,8 @@ async function openConv(id){
     if(!(d.messages||[]).length)showEmptyChat();
     box.scrollTop=box.scrollHeight;
     convStatus((d.meta.pinned?'📌 pinned · ':'')+d.meta.count+' messages');
+    const msel=$('#chat-model');
+    if(msel){const mm=(d.meta&&d.meta.model)||'';const ok=Array.prototype.some.call(msel.options,o=>o.value===mm);msel.value=ok?mm:'';updateChatMeta();}
     await loadChats();
   }catch(e){toast(e.message,true);}
 }
@@ -2755,7 +2757,10 @@ async function heartbeat(){
 }
 $('#chat-send').addEventListener('click',sendChat);
 $('#chat-mode').addEventListener('change',updateChatMeta);
-$('#chat-model').addEventListener('change',updateChatMeta);
+$('#chat-model').addEventListener('change',async()=>{
+  updateChatMeta();
+  if(window._convId){try{await post('/api/chats',{action:'setmodel',id:window._convId,model:$('#chat-model').value||''});}catch(e){}}
+});
 $('#toast').addEventListener('click',e=>{if(e.target.classList.contains('t-x'))$('#toast').className='toast';});
 $('#chat-input').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendChat()}});
 $('#mem-add').addEventListener('click',async()=>{
@@ -3012,6 +3017,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         self._send(200,json.dumps({"ok":conv_delete(body.get("id",""))}))
                     elif act=="pin":
                         self._send(200,json.dumps({"ok":True,"chat":conv_pin(body.get("id",""),bool(body.get("pinned",True)))}))
+                    elif act=="setmodel":
+                        self._send(200,json.dumps({"ok":True,"chat":conv_set_model(body.get("id",""),body.get("model",""))}))
                     elif act=="move":
                         self._send(200,json.dumps({"ok":True,"chats":conv_move(body.get("id",""),int(body.get("delta",0) or 0))}))
                     else:
@@ -3025,6 +3032,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 model=body.get("model")
                 mode=str(body.get("mode","auto")).lower()
                 history=body.get("history") if isinstance(body.get("history"),list) else None
+                if not MODELS:
+                    self._send(400,json.dumps({"ok":False,"error":"No AI models are configured yet — open Settings and add an API key or a local model, or use Auto-detect."})); return
                 if model:
                     try: register_requested_model(model)
                     except Exception as e:
@@ -3078,6 +3087,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "provider":result.get("_provider") if isinstance(result,dict) else None,
                     "role":result.get("_role") if isinstance(result,dict) else None}))
             elif path=="/api/agent":
+                if not MODELS:
+                    self._send(400,json.dumps({"ok":False,"error":"No AI models are configured yet — open Settings and add an API key or a local model, or use Auto-detect."})); return
                 if body.get("model"):
                     try: register_requested_model(body.get("model"))
                     except Exception as e:
@@ -5152,7 +5163,7 @@ def _conv_meta(c):
     msgs = c.get("messages") or []
     return {"id": c.get("id"), "title": c.get("title") or "New chat",
             "created": c.get("created"), "updated": c.get("updated"),
-            "pinned": bool(c.get("pinned")), "count": len(msgs),
+            "pinned": bool(c.get("pinned")), "count": len(msgs), "model": c.get("model") or "",
             "last": (msgs[-1].get("content", "")[:80] if msgs else "")}
 
 def _conv_index(cs, cid):
@@ -5167,7 +5178,8 @@ def conv_list():
 def conv_new(title=""):
     cs = _load_convs()
     c = {"id": str(uuid.uuid4()), "title": (title or "").strip() or "New chat",
-         "created": int(time.time()), "updated": int(time.time()), "pinned": False, "messages": []}
+         "created": int(time.time()), "updated": int(time.time()), "pinned": False, "model": "",
+         "messages": []}
     cs.insert(0, c); _save_convs(cs); log_event("conv_new", id=c["id"], title=c["title"])
     return _conv_meta(c)
 
@@ -5195,6 +5207,12 @@ def conv_rename(cid, title):
     cs = _load_convs(); i = _conv_index(cs, cid)
     if i < 0: raise ValueError("conversation not found")
     cs[i]["title"] = (title or "").strip() or "New chat"; _save_convs(cs)
+    return _conv_meta(cs[i])
+
+def conv_set_model(cid, model):
+    cs = _load_convs(); i = _conv_index(cs, cid)
+    if i < 0: raise ValueError("conversation not found")
+    cs[i]["model"] = (model or "").strip(); _save_convs(cs)
     return _conv_meta(cs[i])
 
 def conv_delete(cid):
