@@ -1741,6 +1741,12 @@ document.addEventListener('click',function(e){
 document.addEventListener('keydown',function(e){
   if(e.key==='Escape'){var p=document.getElementById('live-panel');if(p&&!p.hidden&&typeof closeLivePanel==='function')closeLivePanel();}
 });
+document.addEventListener('click',function(e){
+  var p=document.getElementById('live-panel');if(!p||p.hidden||typeof closeLivePanel!=='function')return;
+  var t=e.target;
+  if(t&&(t.id==='chat-live'||(t.closest&&t.closest('#live-panel'))))return;
+  closeLivePanel();
+},true);
 
 /* navigation */
 const TITLES={overview:'Overview',chat:'Chat',agent:'Agent Manager',memory:'Memory',tools:'Tools',terminal:'Terminal',system:'System',settings:'Settings'};
@@ -2176,13 +2182,22 @@ async function liveTick(){
       const ln=liveLine(e);if(ln)frag.push(ln);
     }
     if(newBrowse&&!window._liveOpened){window._liveOpened=true;openLivePanel();}
-    const box=liveTarget();if(!box)return;
-    if(frag.length){box.innerHTML+=frag.map(esc).join('<br>');box.scrollTop=box.scrollHeight;}
+    if(frag.length){
+      const pp=$('#live-panel');const popupOpen=pp&&!pp.hidden;
+      if(popupOpen){const box=liveTarget();if(box){box.innerHTML+=frag.map(esc).join('<br>');box.scrollTop=box.scrollHeight;}}
+      else {const il=$('#tk-live');if(il){il.style.display='block';il.innerHTML+=frag.map(esc).join('<br>');}}
+    }
   }catch(e){}
 }
 function liveDone(){
+  const pp=$('#live-panel');
+  const wasOpen=pp&&!pp.hidden;
   const t=liveTarget();if(t){t.innerHTML+='<div class="live-end">✓ finished</div>';t.scrollTop=t.scrollHeight;}
   hideWorkChip();
+  if(wasOpen){
+    clearTimeout(window._liveHide);
+    window._liveHide=setTimeout(()=>{const p=$('#live-panel');if(p&&!p.hidden)closeLivePanel();},5000);
+  }
 }
 async function seedLiveSeen(){
   try{
@@ -3150,6 +3165,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
             log_error("api:"+path,e)
             self._send(500,json.dumps({"ok":False,"error":str(e)}))
     def log_message(self,*args): pass
+
+_web_auto_lock=threading.Lock(); _web_auto_on=False
+def autostart_web(port=None):
+    """Start the web Control Center in the background (auto-opens the browser),
+    unless it is disabled. Safe to call from install / repl / bare runs."""
+    global _web_auto_on
+    if os.getenv("OPENCLAW_WEB_DISABLE","")=="1": return
+    with _web_auto_lock:
+        if _web_auto_on: return
+        _web_auto_on=True
+    p=port or int(os.getenv("OPENCLAW_WEB_PORT","8765"))
+    def _run():
+        try: dashboard(p)
+        except Exception as e: log_event("web_autostart_failed",error=str(e))
+    t=threading.Thread(target=_run,daemon=True); t.start()
+    log_event("web_autostart",port=p)
 
 def dashboard(port=8765):
     server=ThreadingHTTPServer(("127.0.0.1",port),DashboardHandler)
@@ -5099,6 +5130,7 @@ def main():
         print("  openclaw-one.sh --help            all commands\n")
         if sys.stdin.isatty():
             print("Starting interactive session (type /exit or Ctrl-D to quit)...\n")
+            autostart_web()
             repl()
         return
     p=argparse.ArgumentParser(description="OpenClaw hybrid gateway with MemPalace")
@@ -5156,7 +5188,9 @@ def main():
         elif x.mc=="dedupe": print(json.dumps(mem_dedupe(),indent=2))
         else: print(json.dumps({"deleted":mem_forget(x.id)}))
     elif x.cmd=="config": show_config()
-    elif x.cmd=="repl": repl()
+    elif x.cmd=="repl":
+        autostart_web()
+        repl()
     elif x.cmd=="backup": backup()
     elif x.cmd=="calendar": print_calendar(x.year,x.month)
     elif x.cmd=="clock": run_clock(x.count)
