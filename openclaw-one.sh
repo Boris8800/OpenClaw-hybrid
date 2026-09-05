@@ -1321,15 +1321,6 @@ body.light pre,body.light textarea,body.light input,body.light select{color:#1c2
 .toast{display:flex;align-items:center;gap:10px}
 .toast .t-x{margin-left:auto;cursor:pointer;opacity:.7;font-weight:700}
 .toast .t-x:hover{opacity:1}
-/* Floating live-activity window (web search / page fetch while a turn runs) */
-.livepanel{position:fixed;right:16px;bottom:16px;width:min(380px,94vw);max-height:52vh;display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--accent2);border-radius:12px;box-shadow:var(--shadow);z-index:70;overflow:hidden}
-.livepanel-hd{display:flex;align-items:center;gap:8px;padding:9px 12px;border-bottom:1px solid var(--line);font-weight:700;font-size:0.857rem;color:var(--accent2);text-transform:uppercase;letter-spacing:.6px}
-.livepanel-hd .dotp{width:8px;height:8px;border-radius:50%;background:var(--ok);animation:pulse 1.1s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
-.livepanel-hd button{margin-left:auto;background:none;border:0;color:var(--muted);cursor:pointer;font-size:1.05rem;line-height:1}
-.livepanel-bd{padding:10px 12px;overflow:auto;font-size:0.857rem;color:var(--muted);line-height:1.75;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;word-break:break-word}
-.livepanel-bd .live-x{color:var(--accent2)}
-.livepanel-bd .live-end{color:var(--ok);font-weight:600;margin-top:6px}
 /* Chat list tabs */
 .chattabs{display:flex;gap:8px;overflow-x:auto;padding:2px 0 4px;align-items:center}
 .chattab{flex:0 0 auto;display:inline-flex;align-items:center;gap:7px;max-width:230px;background:var(--panel2);border:1px solid var(--line);color:var(--muted);border-radius:20px;padding:6px 12px;font-size:0.857rem;cursor:pointer;transition:background .12s,color .12s,border-color .12s;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -1418,7 +1409,6 @@ body.light pre,body.light textarea,body.light input,body.light select{color:#1c2
         <button class="btn ghost sm" id="chat-remember" title="Save this conversation into memory">◈ Remember</button>
         <button class="btn ghost sm" id="chat-export-json" title="Download the conversation as JSON">JSON</button>
         <button class="btn ghost sm" id="chat-dl" title="Download the conversation as Markdown">↓ MD</button>
-        <button class="btn ghost sm" id="chat-live" title="Show live web-search/fetch activity while a turn runs">○ Live: off</button>
         <button class="btn ghost sm" id="chat-clear" title="Clear the conversation" style="margin-left:8px">✕ Clear</button>
       </div><div class="bd">
         <div class="chatbox" id="chatbox"><div class="msg bot"><div class="msg-top"><span class="who">OpenClaw</span><span class="ts" id="welcome-ts"></span></div><div class="msg-body" id="welcome-body">Checking model connection…</div><div class="msg-foot"><button class="msg-rev" title="Reverse this message">↔ reverse</button></div></div></div>
@@ -1691,14 +1681,6 @@ body.light pre,body.light textarea,body.light input,body.light select{color:#1c2
   </div>
 </div>
 
-<!-- Live activity popup -->
-<div class="livepanel" id="live-panel" hidden>
-  <div class="livepanel-hd"><span class="dotp"></span>Live activity
-    <button id="live-close" title="Close">✕</button>
-  </div>
-  <div class="livepanel-bd" id="live-body"><span class="live-x">Watching the agent — start a Web research or browsing turn to see live activity here.</span></div>
-</div>
-
 <!-- Preset settings modal -->
 <div class="modal" id="preset-modal">
   <div class="modal-backdrop" id="preset-backdrop"></div>
@@ -1733,20 +1715,6 @@ async function api(path,opts){
   let j={};try{j=await r.json()}catch(e){j={}}
   if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j}
 const post=(path,body)=>api(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-/* Global, early-registered close handlers for the live panel (survive any later code) */
-document.addEventListener('click',function(e){
-  var c=e.target&&e.target.closest?e.target.closest('#live-close'):null;
-  if(c){e.preventDefault();e.stopPropagation();if(typeof closeLivePanel==='function')closeLivePanel();}
-});
-document.addEventListener('keydown',function(e){
-  if(e.key==='Escape'){var p=document.getElementById('live-panel');if(p&&!p.hidden&&typeof closeLivePanel==='function')closeLivePanel();}
-});
-document.addEventListener('click',function(e){
-  var p=document.getElementById('live-panel');if(!p||p.hidden||typeof closeLivePanel!=='function')return;
-  var t=e.target;
-  if(t&&(t.id==='chat-live'||(t.closest&&t.closest('#live-panel'))))return;
-  closeLivePanel();
-},true);
 
 /* navigation */
 const TITLES={overview:'Overview',chat:'Chat',agent:'Agent Manager',memory:'Memory',tools:'Tools',terminal:'Terminal',system:'System',settings:'Settings'};
@@ -2005,12 +1973,9 @@ async function sendChat(){
   const label=mode==='chat'?('chat · '+target):(mode==='web'?('web research · '+target):(mode==='auto'?('worker agent · '+target):target));
   setRunning(true);showWorkChip('working');
   const ac=new AbortController();window._ocAbort=ac;
-  const webMode=(mode==='web');
   window._tkTimer=setInterval(()=>{const e=$('#tk-elapsed');if(e){const s=((performance.now()-t0)/1000).toFixed(1);e.textContent='elapsed '+s+'s · '+label+' · press ■ to stop';}},300);
-  if(webMode||_liveOn)openLivePanel();
-  window._liveOpened=false;
   window._liveTimer=setInterval(liveTick,900);
-  const clearTimers=()=>{clearInterval(window._tkTimer);window._tkTimer=null;if(window._liveTimer){clearInterval(window._liveTimer);window._liveTimer=null;}if(webMode||_liveOn)liveDone();else hideWorkChip();};
+  const clearTimers=()=>{clearInterval(window._tkTimer);window._tkTimer=null;if(window._liveTimer){clearInterval(window._liveTimer);window._liveTimer=null;}liveDone();const il=$('#tk-live');if(il)il.innerHTML='';};
   try{
     if(!window._convId){try{const nj=await post('/api/chats',{action:'new',title:(text||'').slice(0,40)});window._convId=nj.chat.id;}catch(e){}}
     const j=await api('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:text,conversation:window._convId||'web',model,mode,history}),signal:ac.signal});
@@ -2136,27 +2101,12 @@ function startVoice(){
   rec.start();chatStatus('🎤 listening…');
 }
 
-/* live browsing view: shows the agent's live web search / page-fetch activity */
-let _liveOn=false;
+/* live working status: shows a tiny inline chip + inline lines while a turn runs */
 const _SHORT={'search_started':'searching','search_completed':'results','page_fetch_started':'fetching','page_fetch_completed':'page','chat_web_augmented':'sources','model_attempt':'thinking'};
+const _LIVE_ICON={'search_started':'🔎 searching the web…','search_completed':'✓ got search results','page_fetch_started':'↓ fetching page','page_fetch_completed':'✓ read page','chat_web_augmented':'🧠 building answer from sources','model_attempt':'🤖 asking model'};
+const _BROWSE={'search_started':1,'search_completed':1,'page_fetch_started':1,'page_fetch_completed':1,'chat_web_augmented':1};
 function showWorkChip(w){const c=$('#workchip');if(c){c.style.display='';$('#workword').textContent=w||'working';}}
 function hideWorkChip(){const c=$('#workchip');if(c)c.style.display='none';}
-function liveUI(){const b=$('#chat-live');if(b)b.textContent=_liveOn?'● Live: on':'○ Live: off';}
-function liveTarget(){const p=$('#live-panel');if(p&&!p.hidden)return $('#live-body');return null;}
-function openLivePanel(){
-  const p=$('#live-panel');if(!p)return;
-  if(!p.hidden)return;
-  p.hidden=false;
-  const b=$('#live-body');if(b){b.innerHTML='<span class="live-x">Live — watching web research…</span>';}
-}
-function closeLivePanel(){const p=$('#live-panel');if(p)p.hidden=true;_liveOn=false;window._liveOpened=true;liveUI();}
-function toggleLive(){
-  _liveOn=!_liveOn;liveUI();
-  if(_liveOn)openLivePanel();else closeLivePanel();
-  toast(_liveOn?'Live view on — a small window will show the search in real time':'Live view off');
-}
-$('#live-close').addEventListener('click',closeLivePanel);
-const _LIVE_ICON={'search_started':'🔎 searching the web…','search_completed':'✓ got search results','page_fetch_started':'↓ fetching page','page_fetch_completed':'✓ read page','chat_web_augmented':'🧠 building answer from sources','model_attempt':'🤖 asking model'};
 function liveLine(e){
   const ic=_LIVE_ICON[e.event];if(!ic)return null;
   let extra='';
@@ -2166,39 +2116,23 @@ function liveLine(e){
   else if(e.event==='search_started')extra=' '+((e.query||''));
   return ic+extra;
 }
-const _BROWSE={'search_started':1,'search_completed':1,'page_fetch_started':1,'page_fetch_completed':1,'chat_web_augmented':1};
 async function liveTick(){
   try{
     const j=await api('/api/events?limit=120');const evs=(j.events||[]);
     let last=null;for(const e of evs){ if(_LIVE_ICON[e.event])last=e; }
     if(last){const w=_SHORT[last.event];if(w)showWorkChip(w);}
     const seen=window._liveSeen||(window._liveSeen=new Set());
-    const frag=[];let newBrowse=false;
+    const frag=[];
     for(const e of evs){
       const key=(e.time||'')+'|'+(e.event||'')+'|'+(e.url||e.results||e.model||e.query||'');
       if(seen.has(key))continue;
       seen.add(key);
-      if(_BROWSE[e.event])newBrowse=true;
       const ln=liveLine(e);if(ln)frag.push(ln);
     }
-    if(newBrowse&&!window._liveOpened){window._liveOpened=true;openLivePanel();}
-    if(frag.length){
-      const pp=$('#live-panel');const popupOpen=pp&&!pp.hidden;
-      if(popupOpen){const box=liveTarget();if(box){box.innerHTML+=frag.map(esc).join('<br>');box.scrollTop=box.scrollHeight;}}
-      else {const il=$('#tk-live');if(il){il.style.display='block';il.innerHTML+=frag.map(esc).join('<br>');}}
-    }
+    if(frag.length){const il=$('#tk-live');if(il){il.style.display='block';il.innerHTML+=frag.map(esc).join('<br>');}}
   }catch(e){}
 }
-function liveDone(){
-  const pp=$('#live-panel');
-  const wasOpen=pp&&!pp.hidden;
-  const t=liveTarget();if(t){t.innerHTML+='<div class="live-end">✓ finished</div>';t.scrollTop=t.scrollHeight;}
-  hideWorkChip();
-  if(wasOpen){
-    clearTimeout(window._liveHide);
-    window._liveHide=setTimeout(()=>{const p=$('#live-panel');if(p&&!p.hidden)closeLivePanel();},5000);
-  }
-}
+function liveDone(){hideWorkChip();}
 async function seedLiveSeen(){
   try{
     const j=await api('/api/events?limit=150');const s=new Set();
@@ -2206,7 +2140,8 @@ async function seedLiveSeen(){
     window._liveSeen=s;
   }catch(e){}
 }
-$('#chat-live').addEventListener('click',toggleLive);
+
+
 
 /* chat history / conversations */
 let _convId=null;
