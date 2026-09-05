@@ -1323,6 +1323,7 @@ body.light pre,body.light textarea,body.light input,body.light select{color:#1c2
 .toast .t-x:hover{opacity:1}
 /* Live browsing viewer: shows the ACTUAL page the agent is fetching */
 .livepanel{position:fixed;right:16px;bottom:16px;width:min(520px,94vw);height:min(70vh,560px);display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--line);border-top:3px solid var(--accent2);border-radius:12px;box-shadow:var(--shadow);z-index:70;overflow:hidden}
+#live-panel[hidden]{display:none !important}
 .livepanel-hd{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--line);font-weight:700;font-size:0.786rem;color:var(--accent2);text-transform:uppercase;letter-spacing:.6px;flex:0 0 auto}
 .livepanel-hd .dotp{width:8px;height:8px;border-radius:50%;background:var(--ok);animation:pulse 1.1s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
@@ -2016,10 +2017,15 @@ async function sendChat(){
   window._liveTimer=setInterval(liveTick,900);
   const clearTimers=()=>{clearInterval(window._tkTimer);window._tkTimer=null;if(window._liveTimer){clearInterval(window._liveTimer);window._liveTimer=null;}liveDone();const il=$('#tk-live');if(il)il.innerHTML='';};
   try{
+    // Ensure a conversation exists, then save the user message IMMEDIATELY so it is
+    // never lost (even if the reply fails) and the chat gets a real title.
     if(!window._convId){try{const nj=await post('/api/chats',{action:'new',title:(text||'').slice(0,40)});window._convId=nj.chat.id;}catch(e){}}
-    const j=await api('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:text,conversation:window._convId||'web',model,mode,history}),signal:ac.signal});
+    const convId=window._convId||null;
+    if(convId){try{await post('/api/chats',{action:'msg',id:convId,role:'user',content:text});}catch(e){}}
+    const j=await api('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:text,conversation:convId||'web',model,mode,history}),signal:ac.signal});
     clearTimers();
-    if(window._convId){try{await post('/api/chats',{action:'msg',id:window._convId,role:'user',content:text});await post('/api/chats',{action:'msg',id:window._convId,role:'assistant',content:j.answer||''});loadChats();}catch(e){}}
+    if(convId){try{await post('/api/chats',{action:'msg',id:convId,role:'assistant',content:j.answer||''});}catch(e){}}
+    loadChats();
     const srcs=(j.sources||[]).filter(s=>s&&s.url);
     const srcHtml=srcs.length?`<div class="srcs">${srcs.map(s=>`<a href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.title||s.url)}</a>`).join('')}</div>`:'';
     const mdl=j.model||'';const prov=j.provider||'';const role=j.role||'';
@@ -2030,7 +2036,7 @@ async function sendChat(){
     const mu=j.models_used||[];
     const rolesHtml=mu.length?`<div class="statusline" style="margin-top:6px">${mu.map(u=>`<span class="chip" title="${u.role==='supervisor'?'Supervisor AI — plans & reviews, never writes/executes':'Local worker — does the actual work'}">${u.role==='supervisor'?'🧠 supervisor':'🤖 worker'} · ${esc(u.model)}</span>`).join(' ')}</div>`:'';
     $('#thinking').outerHTML=`<div class="msg bot"><div class="msg-top"><span class="who">OpenClaw ${badge}</span><span class="ts">${chatTs()}</span></div><div class="msg-body">${fmtText(j.answer||'')}</div>${detail}${rolesHtml}${srcHtml}<div class="msg-foot"><button class="msg-rev" title="Reverse this message">↔ reverse</button><button class="msg-rev" style="margin-left:auto" onclick="copyText(this.closest('.msg').querySelector('.msg-body').innerText)">copy</button></div></div>`;
-  }catch(e){clearTimers();const stopped=e&&e.name==='AbortError';$('#thinking').outerHTML=`<div class="msg bot"><div class="msg-top"><span class="who">OpenClaw</span><span class="ts">${chatTs()}</span></div><div class="msg-body"><span style="color:${stopped?'var(--warn)':'var(--bad)'}">${stopped?'stopped (request cancelled)':'error: '+esc(e.message)}</span></div><div class="msg-foot"><button class="msg-rev" title="Reverse this message">↔ reverse</button></div></div>`;}
+  }catch(e){clearTimers();const stopped=e&&e.name==='AbortError';$('#thinking').outerHTML=`<div class="msg bot"><div class="msg-top"><span class="who">OpenClaw</span><span class="ts">${chatTs()}</span></div><div class="msg-body"><span style="color:${stopped?'var(--warn)':'var(--bad)'}">${stopped?'stopped (request cancelled)':'error: '+esc(e.message)}</span></div><div class="msg-foot"><button class="msg-rev" title="Reverse this message">↔ reverse</button></div></div>`;loadChats();}
   finally{setRunning(false);window._ocAbort=null;btn.disabled=false;box.scrollTop=box.scrollHeight;}
 }
 
@@ -3193,6 +3199,45 @@ def open_web(port=None):
         else: webbrowser.open(url)
     except Exception as e: log_event("open_web_failed",error=str(e))
 
+# ============================================================================
+# Installed app lives on the Desktop next to its Start icon, in its own folder,
+# completely separate from this installer (OpenClaw-Instaler).
+APP_HOME = Path.home()/"Desktop"/"OpenClaw"
+
+def install_app_folder():
+    """Copy the current runtime into a dedicated app folder (separate from the
+    installer), give it its own data home, and create its desktop launcher."""
+    import shutil as _sh
+    src=Path(os.path.abspath(__file__)).resolve()
+    APP_HOME.mkdir(parents=True,exist_ok=True)
+    data=APP_HOME/"openclaw-data"; data.mkdir(parents=True,exist_ok=True)
+    dst=APP_HOME/"openclaw-one.sh"
+    try: _sh.copy2(str(src),str(dst))
+    except Exception as e: log_event("app_copy",error=str(e))
+    try: os.chmod(str(dst),0o755)
+    except Exception: pass
+    icon=None
+    try: icon=create_start_icon(APP_HOME)
+    except Exception as e: log_event("app_icon",error=str(e))
+    return {"folder":APP_HOME,"script":dst,"data":data,"app":icon}
+
+def spawn_app_serve(port=None):
+    """Launch the INSTALLED copy (APP_HOME) detached, with its own data home."""
+    if os.getenv("OPENCLAW_WEB_DISABLE","")=="1": return False
+    p=str(port or int(os.getenv("OPENCLAW_WEB_PORT","8765")))
+    script=APP_HOME/"openclaw-one.sh"
+    if not script.exists(): return False
+    try:
+        env=dict(os.environ); env["OPENCLAW_HOME"]=str(APP_HOME/"openclaw-data"); env["OPENCLAW_WEB_PORT"]=p
+        log=APP_HOME/"serve.log"
+        flog=open(str(log),"a",encoding="utf-8")
+        subprocess.Popen(["/bin/bash",str(script),"serve"],env=env,stdout=flog,
+                         stderr=subprocess.STDOUT,start_new_session=True,close_fds=True)
+        log_event("app_service_spawned",port=p)
+        return True
+    except Exception as e:
+        log_event("spawn_app_failed",error=str(e)); return False
+
 def dashboard(port=8765):
     server=ThreadingHTTPServer(("127.0.0.1",port),DashboardHandler)
     try: ensure_comms()
@@ -4074,6 +4119,21 @@ def preinstall_cleanup():
     for cand in sorted(home.iterdir()):
         if cand.is_dir() and re.match(r"^OpenClaw\(.*\)$",cand.name):
             wipe(cand,"old folder "+str(cand))
+    # 6) Other OpenClaw copies/clones on the PC (Downloads, Documents, Desktop, home)
+    #    that contain openclaw-one.sh — but NEVER the running source folder.
+    seen_dirs={src_res}
+    for base in (desktop, home/"Downloads", home/"Documents", home):
+        if not base.is_dir(): continue
+        for cand in sorted(base.iterdir()):
+            try: rp=cand.resolve()
+            except Exception: continue
+            if rp in seen_dirs or not cand.is_dir(): continue
+            seen_dirs.add(rp)
+            nm=cand.name.lower()
+            if "openclaw" in nm and (cand/"openclaw-one.sh").exists():
+                if rp==src_res or src_res in rp.parents or rp in src_res.parents:
+                    failed.append((cand.name,"refusing to delete the running OpenClaw folder")); continue
+                wipe(cand,"old copy "+str(cand))
     for label in removed: print("Deleted:",label)
     for label,err in failed: print("Could not delete",label,":",err)
     if not removed and not failed:
@@ -5268,23 +5328,23 @@ def main():
         print_doctor(res)
         if not res["all_ok"]:
             print("\n[ warn ] Installation finished with issues (you can still start OpenClaw, but set a model later to use AI features).\n")
-        # Self-contained: no dated Desktop bundle or code copies. The launcher
-        # points straight at THIS installer folder, so it always runs the file
-        # being edited here. (preinstall_cleanup already removes older dated bundles.)
+        # Install to a dedicated app folder, separate from this installer.
         try:
-            here=Path(os.path.abspath(__file__)).resolve().parent
-            icon=create_start_icon(here)
-            if icon and icon.get("app"):
-                print(f"[ done ] Start OpenClaw.app runs this folder: {icon['app']}")
+            inst=install_app_folder()
+            print(f"[ done ] OpenClaw installed to its own folder: {inst['folder']}")
+            print(f"[ done ] Runtime script: {inst['script']}   (data: {inst['data']})")
+            app=inst.get("app")
+            if app and app.get("app"):
+                print(f"[ done ] Desktop launcher -> Start OpenClaw.app: {app['app']}")
             else:
-                print("[ note ] Could not create a launcher on this platform.")
+                print("[ note ] Could not create a desktop launcher on this platform.")
         except Exception as e:
-            print("[ note ] Launcher step skipped:",e)
+            print("[ note ] Install-to-folder step failed:",e)
         port=os.getenv("OPENCLAW_WEB_PORT","8765")
-        print("Starting OpenClaw web service (keeps running in the background)...")
-        if spawn_service(port):
-            print(f"[ web ] Control Center: http://127.0.0.1:{port}  (log: {ROOT.parent/'openclaw-serve.log'})")
-            print("[ web ] Opened in your browser. Reopen anytime with 'Start OpenClaw.app' or `openclaw-one.sh serve`.")
+        print("Starting the installed OpenClaw web service (in the background)...")
+        if spawn_app_serve(port):
+            print(f"[ web ] Installed OpenClaw Control Center: http://127.0.0.1:{port}  (log: {APP_HOME/'serve.log'})")
+            print("[ web ] Reopen anytime with 'Start OpenClaw.app' on the Desktop.")
             open_web(port)
         else:
             print("[ web ] Falling back to in-process service.")
